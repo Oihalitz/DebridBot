@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Filecrypt Guard",
+  "version": "1.0.0",
+  "description": "Cierra popups y pestañas de anuncios que intentan sacarte de filecrypt.",
+  "permissions": ["tabs", "webNavigation"],
+  "host_permissions": ["*://*/*"],
+  "background": {
+    "service_worker": "bg.js"
+  }
+}

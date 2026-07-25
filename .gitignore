@@ -1,0 +1,13 @@
+.env
+downloads/
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+.browser-profile/
+.browser-profile-*/
+.filecrypt-cookies.json
+extensions/ublock/
+extensions/ublock_tmp/
+extensions/ublock.zip
+.venv/

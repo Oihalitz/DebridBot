@@ -1,8 +1,7 @@
-telebot
-requests
-requests-html==0.10.0
-lxml==4.9.3
-pandas==2.0.3
-pyrogram
-aiohttp
-tgcrypto
+kurigram>=2.1
+TgCrypto>=1.2.5
+aiohttp>=3.9
+python-dotenv>=1.0
+lxml>=5.0
+pycryptodome>=3.20
+playwright>=1.40

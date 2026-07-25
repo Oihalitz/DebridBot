@@ -1,113 +1,79 @@
-# **Real Debrid Upload (& Parser) to Telegram**
+# Debrid Telegram Bot
 
+**Async** Telegram bot for debrid services: send it a hoster link, a magnet or a `.torrent` file and choose between getting the **direct link** or having the bot **upload the file** to Telegram.
 
+## Features
 
-### ***A code for telegram bot do one of two things:***
+- ⚡ Fully asynchronous (kurigram/pyrogram + aiohttp).
+- 🧩 Multi-service: **Real-Debrid**, **AllDebrid**, **TorBox** and **Premiumize** (use one or several, switch with `/service`).
+- 🔗 **Option 1 — Link**: unlocks the link and gives you the premium direct download.
+- 📤 **Option 2 — File**: downloads the file and uploads it to Telegram with a progress bar (2 GB limit).
+- 🧲 **Torrents**: accepts magnets and `.torrent` files, shows live progress and offers each file with the same two options when finished.
+- 🛠 **Torrent manager** (`/torrents`): browse your torrents, check progress, get links, restart (AllDebrid, Premiumize) or delete them with inline buttons.
+- 📋 **controlc.com pastes**: extracts the links from the paste (prioritizes the hosts in `PASTE_HOST_PRIORITY` in `controlc.py`) and unlocks them all.
+- 🔐 **filecrypt.cc folders**: extracts links via CNL2 (Click'n'Load, same idea as JDownloader). Password: send it after the URL. Captcha folders open **Chrome with uBlock Origin** (+ a small popup guard) so ads don't kick you out of the container.
+- 🪞 Mirror rewriting (e.g. `turb.to` → `turbobit.net`) — edit `MIRRORS` in `main.py`.
+- 🔒 Optional user whitelist (`ALLOWED_USER_IDS`).
 
-- Send the direct link on a message **(Use main.py)**
+## Commands
 
-  - <img src="https://i.ibb.co/RThkmPV/bixfy.jpg" alt="direct link on a message" style="zoom:35%;" />
+| Command | Description |
+|---|---|
+| `/service` | Choose the active debrid service |
+| `/torrents` | Manage your torrents: progress, links, restart, delete |
+| `/help` | Help |
 
-- Download and upload the file to telegram **(Use uploader.py)**
+## Setup
 
-  - <img src="https://i.ibb.co/YLkg0Cf/bixfy.jpg" alt="upload the file to telegram" style="zoom:35%;" />
-  
-> [!NOTE]
-> The max upload size is 2GB.
+1. Copy the config file and fill it in:
 
+   ```bash
+   cp .env.example .env
+   ```
 
-#### But wait... there is more!
+   - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`: [my.telegram.org/apps](https://my.telegram.org/apps)
+   - `TELEGRAM_BOT_TOKEN`: [@BotFather](https://t.me/BotFather)
+   - At least one API key from: [Real-Debrid](https://real-debrid.com/apitoken), [AllDebrid](https://alldebrid.com/apikeys), [TorBox](https://torbox.app/settings), [Premiumize](https://www.premiumize.me/account)
 
-##### You can add hostings that aren't supported by Real Debrid 
+2. Install and run:
 
-##### (And by that i meant mirrors of supported hostings by Real debrid)
-
-Example: Turbobit.net **is** supported but **not** its mirrors on Real Debrid.
-
-('turbobif.com', 'turbobit.com', 'turb.to', 'turb.pw', 'turb.cc', 'turbo.to', 'turbo.pw', 'turbo.cc', 'turbobit.net', 'trbbt.net ')
-
-
-
-*Search for* 
-
-```python
-def get_premium_link(url):
-```
-
-And add the mirror of hostings that aren't supported by Real Debird.
-
-
-
-As you can see in the code:
-
-```python
-for mirror_host in ['turbobif.com', 'turbobit.com', 'turb.to', 'turb.pw', 'turb.cc', 'turbo.to', 'turbo.pw', 'turbo.cc', 'turbobit.net', 'trbbt.net']:
-    url = url.replace(mirror_host, 'turbobit.net')
-```
-
-This allows to allow the mirrors of Turbobit to be accepted. You can add more
-
-Just do in a new line after that:
-
-```python
-for mirror_host in ['MIRROR LINK', 'MIRROR LINK']:
-    url = url.replace(mirror_host, 'ACCEPTED LINK BY RD')
-```
-
-
-
-### How to use?
-
-1. Install python
-
-2. Install requirements
-
-3. ```python
+   ```bash
+   python3 -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
-   ```
-
-4. If you are using docker, edit Docker file, Default is "uploader.py" but you can change it if you want to use "main.py" Also in docker file enter the Real Debrid API and Token
-
-5. Edit main.py and uploader.py with your Real Debrid API and Token
-
-6. If using Docker run them using 
-
-   ```
-   sudo docker build . -t rd
-   ```
-
-   ```
-   sudo docker run rd
-   ```
-
-   
-
-7. run main.py or uploader.py
-
-8. ```python
+   playwright install chromium   # o usa Google Chrome del sistema
    python main.py
    ```
 
-    or 
+   Filecrypt con captcha abre el **Chromium de Playwright** (no el Chrome del
+   sistema: ese ignora `--load-extension`) con **uBlock Origin Lite (MV3)**
+   y **Filecrypt Guard**. El uBlock clásico (MV2) ya no carga en Chrome moderno.
+   En servidores sin pantalla no podrá resolver captchas.
 
-   ```python
-   python uploader.py		
-   ```
+### Docker
 
+```bash
+docker build -t debrid-bot .
+docker run --env-file .env debrid-bot
+```
 
+## Project layout
 
-**HOWEVER....**
+```
+main.py            # Telegram bot (handlers, progress, upload)
+config.py          # Configuration via environment variables / .env
+controlc.py        # controlc.com paste link extraction
+filecrypt.py       # filecrypt.cc (CNL2 + Chrome/uBlock for captcha)
+extensions/
+  ublock/          # uBlock Origin (auto-downloaded if missing)
+  fc-guard/        # closes ad popups
+debrid/
+  base.py          # Common provider interface
+  realdebrid.py    # Real-Debrid
+  alldebrid.py     # AllDebrid (API v4/v4.1)
+  torbox.py        # TorBox (API v1)
+  premiumize.py    # Premiumize
+```
 
-- There is no progress bar yet. So try to check logs if anything wrong happened. 
-- And probably you need more requirements ><
+## Credits
 
-
-
-
-**Thanks**
-
-To [Oihalitz](https://github.com/Oihalitz/RealDebridTelegram) for the base code and to [Anasty17](https://github.com/anasty17) for inspiring me.
-
-
-
-##### **StarMade ✨**
+Original base by [Oihalitz](https://github.com/Oihalitz/RealDebridTelegram), uploader by [StarMade✨](https://github.com/StarMadeThis) inspired by [Anasty17](https://github.com/anasty17).
