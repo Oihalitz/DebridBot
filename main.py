@@ -244,12 +244,13 @@ async def torrent_detail_view(
             InlineKeyboardButton("♻️ Reiniciar", callback_data=f"torre:{slug}:{torrent_id}")
         )
     rows.append(action_row)
-    rows.append(
-        [
-            InlineKeyboardButton("🗑 Eliminar", callback_data=f"tordel:{slug}:{torrent_id}"),
-            InlineKeyboardButton("⬅️ Volver", callback_data=f"torlist:{slug}"),
-        ]
-    )
+    last_row = []
+    if provider.supports_delete:
+        last_row.append(
+            InlineKeyboardButton("🗑 Eliminar", callback_data=f"tordel:{slug}:{torrent_id}")
+        )
+    last_row.append(InlineKeyboardButton("⬅️ Volver", callback_data=f"torlist:{slug}"))
+    rows.append(last_row)
     return text, InlineKeyboardMarkup(rows)
 
 

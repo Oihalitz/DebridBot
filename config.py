@@ -15,6 +15,13 @@ class Config:
     alldebrid_key: str | None
     torbox_key: str | None
     premiumize_key: str | None
+    debridlink_key: str | None
+    deepbrid_key: str | None
+    megadebrid_key: str | None
+    megadebrid_login: str | None
+    megadebrid_password: str | None
+    highway_login: str | None
+    highway_password: str | None
     allowed_users: frozenset[int]
     download_dir: str
 
@@ -44,6 +51,13 @@ def load_config() -> Config:
         alldebrid_key=_env("ALLDEBRID_API_KEY"),
         torbox_key=_env("TORBOX_API_KEY"),
         premiumize_key=_env("PREMIUMIZE_API_KEY"),
+        debridlink_key=_env("DEBRIDLINK_API_KEY"),
+        deepbrid_key=_env("DEEPBRID_API_KEY"),
+        megadebrid_key=_env("MEGADEBRID_API_KEY"),
+        megadebrid_login=_env("MEGADEBRID_LOGIN"),
+        megadebrid_password=_env("MEGADEBRID_PASSWORD"),
+        highway_login=_env("HIGHWAY_LOGIN"),
+        highway_password=_env("HIGHWAY_PASSWORD"),
         allowed_users=allowed,
         download_dir=_env("DOWNLOAD_DIR") or "downloads",
     )

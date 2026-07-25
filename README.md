@@ -5,7 +5,7 @@
 ## Features
 
 - ⚡ Fully asynchronous (kurigram/pyrogram + aiohttp).
-- 🧩 Multi-service: **Real-Debrid**, **AllDebrid**, **TorBox** and **Premiumize** (use one or several, switch with `/service`).
+- 🧩 Multi-service: **Real-Debrid**, **AllDebrid**, **TorBox**, **Premiumize**, **Debrid-Link**, **Mega-Debrid**, **Deepbrid** and **High-Way** (use one or several, switch with `/service`).
 - 🔗 **Option 1 — Link**: unlocks the link and gives you the premium direct download.
 - 📤 **Option 2 — File**: downloads the file and uploads it to Telegram with a progress bar (2 GB limit).
 - 🧲 **Torrents**: accepts magnets and `.torrent` files, shows live progress and offers each file with the same two options when finished.
@@ -33,7 +33,7 @@
 
    - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`: [my.telegram.org/apps](https://my.telegram.org/apps)
    - `TELEGRAM_BOT_TOKEN`: [@BotFather](https://t.me/BotFather)
-   - At least one API key from: [Real-Debrid](https://real-debrid.com/apitoken), [AllDebrid](https://alldebrid.com/apikeys), [TorBox](https://torbox.app/settings), [Premiumize](https://www.premiumize.me/account)
+   - At least one API key from: [Real-Debrid](https://real-debrid.com/apitoken), [AllDebrid](https://alldebrid.com/apikeys), [TorBox](https://torbox.app/settings), [Premiumize](https://www.premiumize.me/account), [Debrid-Link](https://debrid-link.com/webapp/apikey), [Mega-Debrid](https://www.mega-debrid.eu/index.php?page=moncompte) (app API key **or** `MEGADEBRID_LOGIN`/`MEGADEBRID_PASSWORD`), [Deepbrid](https://www.deepbrid.com/account), [High-Way](https://high-way.me) (`HIGHWAY_LOGIN`/`HIGHWAY_PASSWORD`)
 
 2. Install and run:
 
@@ -72,6 +72,10 @@ debrid/
   alldebrid.py     # AllDebrid (API v4/v4.1)
   torbox.py        # TorBox (API v1)
   premiumize.py    # Premiumize
+  debridlink.py    # Debrid-Link (API v2)
+  megadebrid.py    # Mega-Debrid
+  deepbrid.py      # Deepbrid
+  highway.py       # High-Way (link debrid + torrent list; adding torrents is web-only)
 ```
 
 ## Credits

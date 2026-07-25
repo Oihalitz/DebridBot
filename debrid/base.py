@@ -31,6 +31,7 @@ class DebridProvider(ABC):
     name: str
     slug: str
     supports_restart: bool = False
+    supports_delete: bool = True
 
     def __init__(self, api_key: str, session: aiohttp.ClientSession):
         self.api_key = api_key
