@@ -6,7 +6,7 @@ from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
 
 BASE = "https://api.alldebrid.com/v4"
 BASE_41 = "https://api.alldebrid.com/v4.1"
-AGENT = "RealDebridTelegramBot"
+AGENT = "DebridBot"
 
 
 class AllDebrid(DebridProvider):

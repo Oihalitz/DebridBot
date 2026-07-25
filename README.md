@@ -1,6 +1,6 @@
-# Debrid Telegram Bot
+# DebridBot
 
-**Async** Telegram bot for debrid services: send it a hoster link, a magnet or a `.torrent` file and choose between getting the **direct link** or having the bot **upload the file** to Telegram.
+**Async** Telegram bot for multi-debrid services: send it a hoster link, a magnet or a `.torrent` file and choose between getting the **direct link** or having the bot **upload the file** to Telegram.
 
 ## Features
 
@@ -76,4 +76,4 @@ debrid/
 
 ## Credits
 
-Original base by [Oihalitz](https://github.com/Oihalitz/RealDebridTelegram), uploader by [StarMade✨](https://github.com/StarMadeThis) inspired by [Anasty17](https://github.com/anasty17).
+Original base by [Oihalitz](https://github.com/Oihalitz/DebridBot) (formerly RealDebridTelegram), uploader by [StarMade✨](https://github.com/StarMadeThis) inspired by [Anasty17](https://github.com/anasty17).
