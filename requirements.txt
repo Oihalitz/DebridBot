@@ -5,4 +5,4 @@ aiohttp-socks>=0.9
 python-dotenv>=1.0
 lxml>=5.0
 pycryptodome>=3.20
-playwright>=1.40
+playwright>=1.61.0
