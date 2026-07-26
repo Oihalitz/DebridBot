@@ -1,0 +1,16 @@
+# secretos y estado local: van por --env-file y volúmenes, no dentro de la imagen
+.env
+*.session
+*.session-journal
+downloads/
+
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+
+# uBlock se descarga solo en el primer arranque; fc-guard sí se copia
+extensions/ublock/
+extensions/ublock.zip
+README.md

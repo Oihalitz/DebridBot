@@ -57,8 +57,12 @@
 
 ```bash
 docker build -t debrid-bot .
-docker run --env-file .env debrid-bot
+docker run -d --env-file .env -p 8845:8845 -v debrid_downloads:/app/downloads debrid-bot
 ```
+
+- `-p 8845:8845` is only needed if you enable `LINK_PROXY`.
+- Add `--build-arg INSTALL_BROWSER=true` to bundle Playwright's Chromium (~700 MB extra) for filecrypt. Note that captcha-protected folders still need a display, so on a headless VPS they won't work either way — CNL2 folders (no captcha) work fine without the browser.
+- The `.env` file is passed at runtime and never baked into the image.
 
 ## Project layout
 
