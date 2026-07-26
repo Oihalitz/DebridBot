@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Dependencias de Python (requirements.txt)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      # un solo PR semanal con todas las actualizaciones menores/parche
+      python-minor:
+        update-types: [minor, patch]
+    labels: [dependencies]
+
+  # Imagen base del Dockerfile
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+
+  # Workflows de GitHub Actions (por si se añade CI más adelante)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
