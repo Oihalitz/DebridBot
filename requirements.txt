@@ -1,6 +1,6 @@
 kurigram>=2.1
 TgCrypto>=1.2.5
-aiohttp>=3.9
+aiohttp>=3.14.3
 aiohttp-socks>=0.9
 python-dotenv>=1.0
 lxml>=5.0
