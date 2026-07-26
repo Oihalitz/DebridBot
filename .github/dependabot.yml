@@ -7,9 +7,9 @@ updates:
       interval: weekly
       day: monday
     groups:
-      # un solo PR semanal con todas las actualizaciones menores/parche
-      python-minor:
-        update-types: [minor, patch]
+      # TODAS las actualizaciones de pip en un único PR semanal
+      python-deps:
+        patterns: ["*"]
     labels: [dependencies]
 
   # Imagen base del Dockerfile
