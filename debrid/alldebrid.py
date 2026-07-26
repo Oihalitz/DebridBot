@@ -85,7 +85,7 @@ class AllDebrid(DebridProvider):
         magnets = data.get("magnets") or []
         if isinstance(magnets, dict):
             magnets = [magnets]
-        return [self._to_info(m) for m in magnets[:20]]
+        return [self._to_info(m) for m in magnets[:100]]
 
     async def delete_torrent(self, torrent_id: str) -> None:
         await self._request("POST", "/magnet/delete", data={"id": torrent_id})

@@ -10,6 +10,7 @@ import aiohttp
 from pyrogram import Client, filters, idle
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -19,6 +20,7 @@ from pyrogram.types import (
 from config import load_config
 from controlc import get_paste_links
 from debrid import DebridError, DebridProvider, UnrestrictedLink, build_providers
+from linkproxy import LinkProxy, detect_public_ip
 from filecrypt import (
     CaptchaRequired,
     FilecryptError,
@@ -49,6 +51,8 @@ app = Client(
 )
 
 http: aiohttp.ClientSession
+debrid_http: aiohttp.ClientSession  # con DEBRID_PROXY sale por el proxy; si no, es `http`
+link_proxy: LinkProxy | None = None
 providers: dict[str, DebridProvider] = {}
 user_service: dict[int, str] = {}
 pending: dict[str, tuple[UnrestrictedLink, str]] = {}
@@ -131,6 +135,45 @@ def remember(link: UnrestrictedLink, provider: DebridProvider) -> str:
     return token
 
 
+def providers_for_url(user_id: int, url: str) -> list[DebridProvider]:
+    """Orden de servicios a probar: regla de host > servicio activo > resto (failover)."""
+    hostname = (urlparse(url).hostname or "").lower()
+    ordered: list[DebridProvider] = []
+    for rule_host, slug in cfg.host_rules:
+        if rule_host in hostname and slug in providers:
+            ordered.append(providers[slug])
+            break
+    active = provider_for(user_id)
+    if active not in ordered:
+        ordered.append(active)
+    if not cfg.failover:
+        return ordered[:1]
+    return ordered + [p for p in providers.values() if p not in ordered]
+
+
+async def unrestrict_url(user_id: int, url: str) -> tuple[UnrestrictedLink, DebridProvider]:
+    """Prueba los servicios en orden y devuelve el primero que desbloquee el enlace."""
+    errors: list[str] = []
+    for provider in providers_for_url(user_id, url):
+        try:
+            return await provider.unrestrict(url), provider
+        except DebridError as exc:
+            log.info("Failover: %s no desbloqueó %s (%s)", provider.name, url, exc)
+            errors.append(str(exc))
+        except Exception:
+            log.exception("Error inesperado desbloqueando %s con %s", url, provider.name)
+            errors.append(f"{provider.name}: error inesperado")
+    raise DebridError("\n".join(errors))
+
+
+def public_url(link: UnrestrictedLink) -> str:
+    # con LINK_PROXY el usuario recibe una URL del bot, no la del debrid,
+    # para que el debrid solo vea descargas desde la IP del servidor
+    if link_proxy:
+        return link_proxy.register(link)
+    return link.url
+
+
 def describe(link: UnrestrictedLink, provider_name: str) -> str:
     lines = [f"📄 **Archivo:** {link.filename}", f"🌐 **Host:** {link.host}"]
     if link.size:
@@ -205,20 +248,68 @@ async def cmd_service(_, message: Message):
     )
 
 
-async def torrents_list_view(provider: DebridProvider) -> tuple[str, InlineKeyboardMarkup]:
+TORRENTS_PAGE_SIZE = 8
+# clave -> (etiqueta del botón, estados que incluye; None = todos)
+TORRENT_FILTERS = {
+    "all": ("Todos", None),
+    "active": ("⏬", ("queued", "downloading")),
+    "ready": ("✅", ("ready",)),
+    "error": ("❌", ("error",)),
+}
+# última página/filtro que veía cada chat, para que "Volver" no te mande a la primera
+torrents_view_state: dict[int, tuple[int, str]] = {}
+
+
+async def torrents_list_view(
+    provider: DebridProvider, chat_id: int, page: int = 0, flt: str = "all"
+) -> tuple[str, InlineKeyboardMarkup]:
+    if flt not in TORRENT_FILTERS:
+        flt = "all"
     torrents = await provider.list_torrents()
+    statuses = TORRENT_FILTERS[flt][1]
+    filtered = [t for t in torrents if statuses is None or t.status in statuses]
+
+    pages = max(1, -(-len(filtered) // TORRENTS_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    torrents_view_state[chat_id] = (page, flt)
+    slug = provider.slug
+
     rows = []
-    for torrent in torrents:
+    for torrent in filtered[page * TORRENTS_PAGE_SIZE : (page + 1) * TORRENTS_PAGE_SIZE]:
         emoji = STATUS_EMOJI.get(torrent.status, "❔")
         label = f"{emoji} {torrent.name[:35]} · {torrent.progress:.0f}%"
-        rows.append(
-            [InlineKeyboardButton(label, callback_data=f"tor:{provider.slug}:{torrent.id}")]
+        rows.append([InlineKeyboardButton(label, callback_data=f"tor:{slug}:{torrent.id}")])
+
+    filter_row = [
+        InlineKeyboardButton(
+            f"· {label} ·" if key == flt else label,
+            callback_data=f"torlist:{slug}:0:{key}",
         )
-    rows.append([InlineKeyboardButton("🔄 Actualizar", callback_data=f"torlist:{provider.slug}")])
+        for key, (label, _) in TORRENT_FILTERS.items()
+    ]
+    rows.append(filter_row)
+
+    nav_row = []
+    if pages > 1:
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton("⬅️", callback_data=f"torlist:{slug}:{page - 1}:{flt}")
+            )
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop:-"))
+        if page < pages - 1:
+            nav_row.append(
+                InlineKeyboardButton("➡️", callback_data=f"torlist:{slug}:{page + 1}:{flt}")
+            )
+    nav_row.append(InlineKeyboardButton("🔄", callback_data=f"torlist:{slug}:{page}:{flt}"))
+    rows.append(nav_row)
+
     if not torrents:
         text = f"No tienes torrents en {provider.name}."
+    elif not filtered:
+        text = f"🧲 **{provider.name}**: ningún torrent con ese filtro (hay {len(torrents)} en total)."
     else:
-        text = f"🧲 **Torrents en {provider.name}** ({len(torrents)})\nToca uno para gestionarlo:"
+        shown = f"{len(filtered)}" if flt == "all" else f"{len(filtered)} de {len(torrents)}"
+        text = f"🧲 **Torrents en {provider.name}** ({shown})\nToca uno para gestionarlo:"
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -259,7 +350,7 @@ async def cmd_torrents(_, message: Message):
     provider = provider_for(message.from_user.id)
     status = await message.reply_text(f"🔎 Consultando torrents en {provider.name}...")
     try:
-        text, keyboard = await torrents_list_view(provider)
+        text, keyboard = await torrents_list_view(provider, message.chat.id)
     except DebridError as exc:
         await safe_edit(status, f"❌ {exc}")
         return
@@ -307,18 +398,15 @@ async def handle_text(_, message: Message):
         return
 
     url = normalize_mirrors(text)
-    status = await message.reply_text(f"🔎 Desbloqueando con {provider.name}...")
+    first = providers_for_url(message.from_user.id, url)[0]
+    status = await message.reply_text(f"🔎 Desbloqueando con {first.name}...")
     try:
-        link = await provider.unrestrict(url)
+        link, used = await unrestrict_url(message.from_user.id, url)
     except DebridError as exc:
         await safe_edit(status, f"❌ {exc}")
         return
-    except Exception:
-        log.exception("Error desbloqueando %s", url)
-        await safe_edit(status, "❌ Error inesperado desbloqueando el enlace.")
-        return
-    token = remember(link, provider)
-    await safe_edit(status, describe(link, provider.name), reply_markup=action_keyboard(token))
+    token = remember(link, used)
+    await safe_edit(status, describe(link, used.name), reply_markup=action_keyboard(token))
 
 
 MAX_CONTAINER_LINKS = 20
@@ -338,16 +426,12 @@ async def unlock_many(
     unlocked = 0
     for raw_link in links[:MAX_CONTAINER_LINKS]:
         try:
-            link = await provider.unrestrict(normalize_mirrors(raw_link))
+            link, used = await unrestrict_url(message.from_user.id, normalize_mirrors(raw_link))
         except DebridError as exc:
             await message.reply_text(f"❌ `{raw_link}`\n{exc}")
             continue
-        except Exception:
-            log.exception("Error desbloqueando %s", raw_link)
-            await message.reply_text(f"❌ `{raw_link}`\nError inesperado.")
-            continue
-        token = remember(link, provider)
-        await message.reply_text(describe(link, provider.name), reply_markup=action_keyboard(token))
+        token = remember(link, used)
+        await message.reply_text(describe(link, used.name), reply_markup=action_keyboard(token))
         unlocked += 1
     summary = f"{emoji} {label}: {unlocked}/{total} enlace(s) desbloqueado(s)."
     if len(links) > MAX_CONTAINER_LINKS:
@@ -492,6 +576,10 @@ async def on_callback(client: Client, query: CallbackQuery):
 
     action, _, value = query.data.partition(":")
 
+    if action == "noop":  # indicador de página, no hace nada
+        await query.answer()
+        return
+
     if action in ("tor", "torlist", "torlinks", "torre", "tordel", "tordelok"):
         await handle_torrent_callback(query, action, value)
         return
@@ -519,7 +607,7 @@ async def on_callback(client: Client, query: CallbackQuery):
             await query.answer()
             await safe_edit(
                 query.message,
-                describe(link, provider_name) + f"\n\n🔗 [Descargar]({link.url})",
+                describe(link, provider_name) + f"\n\n🔗 [Descargar]({public_url(link)})",
             )
             return
 
@@ -528,7 +616,7 @@ async def on_callback(client: Client, query: CallbackQuery):
             await safe_edit(
                 query.message,
                 describe(link, provider_name)
-                + f"\n\n❌ Supera el límite de 2 GB de Telegram.\n🔗 [Descargar]({link.url})",
+                + f"\n\n❌ Supera el límite de 2 GB de Telegram.\n🔗 [Descargar]({public_url(link)})",
             )
             return
 
@@ -547,10 +635,17 @@ async def handle_torrent_callback(query: CallbackQuery, action: str, value: str)
         await query.answer("Ese servicio ya no está configurado.", show_alert=True)
         return
 
+    chat_id = query.message.chat.id
     try:
         if action == "torlist":
             await query.answer()
-            text, keyboard = await torrents_list_view(provider)
+            # torlist:slug[:página:filtro]; sin ellos ("Volver") recupera los últimos
+            page_s, _, flt = torrent_id.partition(":")
+            if page_s:
+                page, flt = int(page_s), flt or "all"
+            else:
+                page, flt = torrents_view_state.get(chat_id, (0, "all"))
+            text, keyboard = await torrents_list_view(provider, chat_id, page, flt)
             await safe_edit(query.message, text, reply_markup=keyboard)
 
         elif action == "tor":
@@ -605,7 +700,8 @@ async def handle_torrent_callback(query: CallbackQuery, action: str, value: str)
         elif action == "tordelok":
             await provider.delete_torrent(torrent_id)
             await query.answer("🗑 Torrent eliminado.")
-            text, keyboard = await torrents_list_view(provider)
+            page, flt = torrents_view_state.get(chat_id, (0, "all"))
+            text, keyboard = await torrents_list_view(provider, chat_id, page, flt)
             await safe_edit(query.message, text, reply_markup=keyboard)
 
     except DebridError as exc:
@@ -628,7 +724,7 @@ async def transfer(client: Client, message: Message, link: UnrestrictedLink):
         await safe_edit(
             progress,
             f"❌ El archivo pesa {human_size(exc.size)} y supera el límite de 2 GB.\n"
-            f"🔗 [Descargar]({link.url})",
+            f"🔗 [Descargar]({public_url(link)})",
         )
     except Exception as exc:
         log.exception("Error transfiriendo %s", link.filename)
@@ -642,7 +738,7 @@ async def download_file(link: UnrestrictedLink, progress: Message) -> str:
     os.makedirs(cfg.download_dir, exist_ok=True)
     path = os.path.join(cfg.download_dir, f"{uuid.uuid4().hex[:8]}_{safe_filename(link.filename)}")
     last_edit = 0.0
-    async with http.get(link.url) as resp:
+    async with debrid_http.get(link.url) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("Content-Length") or 0) or (link.size or 0)
         if total > MAX_TG_SIZE:
@@ -695,17 +791,70 @@ async def upload_to_telegram(
 
 # ---------------------------------------------------------------- arranque
 
+def _masked_proxy(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        host = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+        return f"{parsed.scheme}://***@{host}"
+    return url
+
+
 async def main():
-    global http, providers
-    http = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=300)
-    )
-    providers = build_providers(cfg, http)
+    global http, debrid_http, providers
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=300)
+    http = aiohttp.ClientSession(timeout=timeout)
+    if cfg.debrid_proxy:
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError:
+            raise SystemExit(
+                "DEBRID_PROXY necesita el paquete aiohttp-socks: pip install aiohttp-socks"
+            )
+        proxy_url = cfg.debrid_proxy
+        if proxy_url.startswith("socks5h://"):
+            # la librería no conoce el esquema socks5h: es socks5 con DNS remoto
+            connector = ProxyConnector.from_url("socks5://" + proxy_url[10:], rdns=True)
+        else:
+            connector = ProxyConnector.from_url(proxy_url)
+        debrid_http = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        log.info("Proxy para servicios debrid: %s", _masked_proxy(cfg.debrid_proxy))
+    else:
+        debrid_http = http
+    global link_proxy
+    if cfg.link_proxy:
+        base_url = cfg.link_proxy_url
+        if not base_url:
+            # sin URL pública configurada, usa la IP pública del servidor
+            base_url = f"http://{await detect_public_ip(http)}:{cfg.link_proxy_port}"
+        link_proxy = LinkProxy(debrid_http, base_url)
+        await link_proxy.start("0.0.0.0", cfg.link_proxy_port)
+        log.info(
+            "Relay de enlaces activo en %s (puerto %d abierto hacia fuera, recuérdalo)",
+            link_proxy.base_url,
+            cfg.link_proxy_port,
+        )
+
+    providers = build_providers(cfg, debrid_http)
+    for rule_host, slug in cfg.host_rules:
+        if slug not in providers:
+            log.warning(
+                "HOST_RULES: la regla '%s:%s' apunta a un servicio no configurado; se ignora",
+                rule_host,
+                slug,
+            )
     if not providers:
         raise SystemExit(
             "Configura al menos una API key: REALDEBRID_API_KEY, ALLDEBRID_API_KEY o TORBOX_API_KEY"
         )
     await app.start()
+    # menú de comandos de Telegram (autocompletado al escribir "/")
+    await app.set_bot_commands(
+        [
+            BotCommand("service", "Elegir el servicio debrid activo"),
+            BotCommand("torrents", "Gestionar tus torrents"),
+            BotCommand("help", "Ayuda y ejemplos de uso"),
+        ]
+    )
     me = await app.get_me()
     log.info(
         "Bot @%s iniciado. Servicios: %s",
@@ -714,6 +863,10 @@ async def main():
     )
     await idle()
     await app.stop()
+    if link_proxy:
+        await link_proxy.stop()
+    if debrid_http is not http:
+        await debrid_http.close()
     await http.close()
 
 

@@ -83,7 +83,7 @@ class DebridLink(DebridProvider):
         ]
 
     async def list_torrents(self) -> list[TorrentInfo]:
-        value = await self._request("GET", "/seedbox/list", params={"perPage": 20})
+        value = await self._request("GET", "/seedbox/list", params={"perPage": 100})
         return [self._to_info(torrent) for torrent in value or []]
 
     async def delete_torrent(self, torrent_id: str) -> None:

@@ -105,7 +105,7 @@ class MegaDebrid(DebridProvider):
         torrents = payload.get("torrents") or []
         return [
             self._to_info(t, str(t.get("hash") or t.get("id") or t.get("name", "?")))
-            for t in torrents[:20]
+            for t in torrents[:100]
         ]
 
     async def delete_torrent(self, torrent_id: str) -> None:

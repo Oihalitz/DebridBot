@@ -122,7 +122,7 @@ class TorBox(DebridProvider):
     async def list_torrents(self) -> list[TorrentInfo]:
         data = await self._request("GET", "/torrents/mylist", params={"bypass_cache": "true"})
         items = data if isinstance(data, list) else [data] if data else []
-        return [self._to_info(item) for item in items[:20]]
+        return [self._to_info(item) for item in items[:100]]
 
     async def delete_torrent(self, torrent_id: str) -> None:
         await self._request(

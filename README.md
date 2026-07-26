@@ -14,6 +14,10 @@
 - 🔐 **filecrypt.cc folders**: extracts links via CNL2 (Click'n'Load, same idea as JDownloader). Password: send it after the URL. Captcha folders open **Chrome with uBlock Origin** (+ a small popup guard) so ads don't kick you out of the container.
 - 🪞 Mirror rewriting (e.g. `turb.to` → `turbobit.net`) — edit `MIRRORS` in `main.py`.
 - 🔒 Optional user whitelist (`ALLOWED_USER_IDS`).
+- 🧦 Optional proxy for debrid traffic only (`DEBRID_PROXY`): SOCKS5/SOCKS4/HTTP. Useful on VPSes whose datacenter IPs are blocked by AllDebrid & co. — API calls **and** file downloads go through the proxy, Telegram stays direct.
+- 🎯 Per-hoster routing (`HOST_RULES`): pin a hoster to a specific service, e.g. `rapidgator:torbox` unlocks every rapidgator link with TorBox regardless of the active service.
+- 🛟 Automatic failover (`FAILOVER`, on by default): if the chosen service can't unlock a link, the bot silently tries your other configured services and answers with the first one that works.
+- 🔁 Optional link relay (`LINK_PROXY`): instead of the raw debrid URL you get a URL served by the bot itself (`http://bot_ip:8845/dl/…`), and the bot streams the file from the debrid. The debrid only ever sees one IP (the server's), which avoids "downloads from multiple IPs" bans when the bot runs on a VPS. Supports resume/Range. Remember to open the port.
 
 ## Commands
 

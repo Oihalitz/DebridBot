@@ -141,7 +141,7 @@ class Highway(DebridProvider):
         ]
 
     async def list_torrents(self) -> list[TorrentInfo]:
-        return [self._to_info(t) for t in (await self._torrents())[:20]]
+        return [self._to_info(t) for t in (await self._torrents())[:100]]
 
     async def delete_torrent(self, torrent_id: str) -> None:
         raise DebridError(f"{self.name}: la API no permite borrar torrents")

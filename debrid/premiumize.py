@@ -123,7 +123,7 @@ class Premiumize(DebridProvider):
     async def list_torrents(self) -> list[TorrentInfo]:
         data = await self._request("GET", "/transfer/list")
         transfers = data.get("transfers") or []
-        return [self._to_info(transfer) for transfer in transfers[:20]]
+        return [self._to_info(transfer) for transfer in transfers[:100]]
 
     async def delete_torrent(self, torrent_id: str) -> None:
         await self._request("POST", "/transfer/delete", data={"id": torrent_id})

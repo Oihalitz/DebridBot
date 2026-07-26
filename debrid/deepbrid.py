@@ -88,7 +88,7 @@ class Deepbrid(DebridProvider):
         payload = await self._request("GET", "/torrents/info")
         # sin id la respuesta es {"1": {...}, "2": {...}} con claves numéricas
         entries = [v for v in payload.values() if isinstance(v, dict) and v.get("id")]
-        return [self._to_info(entry) for entry in entries[:20]]
+        return [self._to_info(entry) for entry in entries[:100]]
 
     async def delete_torrent(self, torrent_id: str) -> None:
         raise DebridError(f"{self.name}: la API no permite borrar torrents")
