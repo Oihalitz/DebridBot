@@ -57,6 +57,10 @@ providers: dict[str, DebridProvider] = {}
 user_service: dict[int, str] = {}
 pending: dict[str, tuple[UnrestrictedLink, str]] = {}
 
+# asyncio solo guarda referencias débiles a las tareas: sin esto el GC puede
+# matar un monitor_torrent/transfer en marcha y el mensaje se queda congelado
+background_tasks: set[asyncio.Task] = set()
+
 MAX_TG_SIZE = 2 * 1024**3  # límite de subida para bots (2 GB)
 MAX_TORRENT_FILES = 25
 STATUS_EMOJI = {"queued": "🕓", "downloading": "⬇️", "ready": "✅", "error": "❌"}
@@ -104,10 +108,22 @@ def is_url(text: str) -> bool:
         return False
 
 
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
+
 def normalize_mirrors(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
     for canonical, mirrors in MIRRORS.items():
         for mirror in mirrors:
-            url = url.replace(mirror, canonical)
+            if hostname == mirror or hostname.endswith("." + mirror):
+                new_host = hostname[: len(hostname) - len(mirror)] + canonical
+                netloc = new_host + (f":{parsed.port}" if parsed.port else "")
+                return parsed._replace(netloc=netloc).geturl()
     return url
 
 
@@ -510,7 +526,7 @@ async def start_torrent(
         log.exception("Error añadiendo torrent")
         await safe_edit(status, "❌ Error inesperado añadiendo el torrent.")
         return
-    asyncio.create_task(monitor_torrent(provider, status, torrent_id))
+    spawn(monitor_torrent(provider, status, torrent_id))
 
 
 async def monitor_torrent(provider: DebridProvider, status: Message, torrent_id: str):
@@ -625,7 +641,7 @@ async def on_callback(client: Client, query: CallbackQuery):
             await query.message.edit_reply_markup(None)
         except Exception:
             pass
-        asyncio.create_task(transfer(client, query.message, link))
+        spawn(transfer(client, query.message, link))
 
 
 async def handle_torrent_callback(query: CallbackQuery, action: str, value: str):
