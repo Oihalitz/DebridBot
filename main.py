@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 from pyrogram import Client, filters, idle
@@ -64,6 +64,30 @@ background_tasks: set[asyncio.Task] = set()
 MAX_TG_SIZE = 2 * 1024**3  # límite de subida para bots (2 GB)
 MAX_TORRENT_FILES = 25
 STATUS_EMOJI = {"queued": "🕓", "downloading": "⬇️", "ready": "✅", "error": "❌"}
+DIRECT_PROVIDER = "Directo"
+DIRECT_USER_AGENT = (
+    "Mozilla/5.0 (compatible; DebridBot/1.0; +https://github.com/Oihalitz/DebridBot)"
+)
+# Content-Types que casi siempre son páginas, no descargas de archivo
+_PAGE_CONTENT_TYPES = frozenset({
+    "text/html",
+    "application/xhtml+xml",
+    "application/xhtml",
+    "text/xhtml",
+})
+# Extensiones de "página web" si no hay Content-Disposition de archivo
+_PAGE_EXTENSIONS = frozenset({
+    ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".cgi", ".shtml",
+})
+_CD_FILENAME_RE = re.compile(
+    r"""filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)|filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;\s]+)""",
+    re.I,
+)
+# github.com/owner/repo/blob/ref/path → raw.githubusercontent.com/owner/repo/ref/path
+_GITHUB_BLOB_RE = re.compile(
+    r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$",
+    re.I,
+)
 
 # Mirrors de hosters que el debrid no reconoce pero que apuntan al mismo sitio
 MIRRORS = {
@@ -77,6 +101,10 @@ MIRRORS = {
 class FileTooLarge(Exception):
     def __init__(self, size: int):
         self.size = size
+
+
+class DirectDownloadError(Exception):
+    """La URL no es un archivo descargable (HTML, error de red, etc.)."""
 
 
 def _auth(_, __, update) -> bool:
@@ -142,13 +170,180 @@ def provider_for(user_id: int) -> DebridProvider:
     return providers[active_slug(user_id)]
 
 
-def remember(link: UnrestrictedLink, provider: DebridProvider) -> str:
+def remember(link: UnrestrictedLink, provider: DebridProvider | str) -> str:
     if len(pending) > 500:
         for key in list(pending)[:100]:
             pending.pop(key, None)
     token = uuid.uuid4().hex[:12]
-    pending[token] = (link, provider.name)
+    name = provider if isinstance(provider, str) else provider.name
+    pending[token] = (link, name)
     return token
+
+
+def normalize_github_url(url: str) -> str:
+    """Convierte enlaces /blob/ de GitHub a raw.githubusercontent.com."""
+    match = _GITHUB_BLOB_RE.match(url.strip())
+    if not match:
+        return url
+    owner, repo, ref, path = match.groups()
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+
+
+def filename_from_content_disposition(header: str | None) -> str | None:
+    if not header:
+        return None
+    match = _CD_FILENAME_RE.search(header)
+    if not match:
+        return None
+    raw = next(g for g in match.groups() if g)
+    return safe_filename(unquote(raw.strip().strip('"')))
+
+
+def filename_from_url(url: str) -> str | None:
+    path = unquote(urlparse(url).path or "")
+    name = os.path.basename(path.rstrip("/"))
+    if not name or "." not in name:
+        return None
+    return safe_filename(name)
+
+
+def _looks_like_file_name(name: str | None) -> bool:
+    if not name or "." not in name:
+        return False
+    ext = os.path.splitext(name)[1].lower()
+    return bool(ext) and ext not in _PAGE_EXTENSIONS
+
+
+def is_downloadable_file(
+    content_type: str | None,
+    content_disposition: str | None,
+    final_url: str,
+) -> bool:
+    """True solo si la respuesta parece un archivo, no una página HTML."""
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    cd = content_disposition or ""
+    cd_name = filename_from_content_disposition(cd)
+    has_attachment = "attachment" in cd.lower()
+    url_name = filename_from_url(final_url)
+
+    # HTML / XHTML: nunca lo tratamos como descarga de archivo
+    if ctype in _PAGE_CONTENT_TYPES:
+        return False
+
+    if has_attachment or cd_name:
+        # attachment/.filename en CD = archivo, salvo extensión de página web
+        if cd_name:
+            ext = os.path.splitext(cd_name)[1].lower()
+            if ext in _PAGE_EXTENSIONS:
+                return False
+        return True
+
+    if not ctype or ctype == "application/octet-stream":
+        # sin tipo claro: exigir nombre con extensión que no sea de página
+        return _looks_like_file_name(url_name)
+
+    if ctype.startswith(("application/", "video/", "audio/", "image/", "font/", "model/")):
+        return True
+
+    # text/* (csv, plain, markdown…): solo con nombre de archivo reconocible
+    if ctype.startswith("text/"):
+        return _looks_like_file_name(cd_name or url_name)
+
+    return False
+
+
+async def _probe_headers(session: aiohttp.ClientSession, url: str) -> tuple[str, dict[str, str], int]:
+    """Devuelve (url_final, headers_lower, status). Prefiere HEAD; si falla, GET corto."""
+    headers = {"User-Agent": DIRECT_USER_AGENT, "Accept": "*/*"}
+    timeout = aiohttp.ClientTimeout(total=30, connect=15, sock_read=20)
+
+    try:
+        async with session.head(
+            url, headers=headers, allow_redirects=True, timeout=timeout
+        ) as resp:
+            if resp.status < 400:
+                return (
+                    str(resp.url),
+                    {k.lower(): v for k, v in resp.headers.items()},
+                    resp.status,
+                )
+            # 405/501 = HEAD no soportado; otros 4xx/5xx se reintentan con GET por si acaso
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+
+    # GET con Range: solo cabeceras (y 1 byte si lo sirven); el context manager cierra el body
+    get_headers = {**headers, "Range": "bytes=0-0"}
+    async with session.get(
+        url, headers=get_headers, allow_redirects=True, timeout=timeout
+    ) as resp:
+        return (
+            str(resp.url),
+            {k.lower(): v for k, v in resp.headers.items()},
+            resp.status,
+        )
+
+
+async def probe_direct_file(session: aiohttp.ClientSession, url: str) -> UnrestrictedLink:
+    """Comprueba que la URL entrega un archivo real y construye UnrestrictedLink."""
+    url = normalize_github_url(url.strip())
+    try:
+        final_url, hdrs, status = await _probe_headers(session, url)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise DirectDownloadError(f"No se pudo conectar: {exc}") from exc
+
+    if status >= 400:
+        raise DirectDownloadError(f"El servidor respondió HTTP {status}")
+
+    content_type = hdrs.get("content-type")
+    content_disposition = hdrs.get("content-disposition")
+    if not is_downloadable_file(content_type, content_disposition, final_url):
+        ctype = (content_type or "desconocido").split(";")[0].strip()
+        raise DirectDownloadError(
+            f"No parece un archivo descargable (Content-Type: {ctype}). "
+            "Solo acepto enlaces directos a archivos, no páginas web."
+        )
+
+    filename = (
+        filename_from_content_disposition(content_disposition)
+        or filename_from_url(final_url)
+        or f"archivo_{uuid.uuid4().hex[:8]}"
+    )
+    size = None
+    # Content-Length normal, o Content-Range: bytes 0-0/12345
+    if "content-range" in hdrs:
+        cr = hdrs["content-range"]
+        if "/" in cr:
+            total = cr.rsplit("/", 1)[-1]
+            if total.isdigit():
+                size = int(total)
+    if size is None and "content-length" in hdrs:
+        try:
+            cl = int(hdrs["content-length"])
+            # con Range: bytes=0-0 el Content-Length suele ser 1
+            if "content-range" not in hdrs:
+                size = cl
+        except ValueError:
+            pass
+
+    host = (urlparse(final_url).hostname or "direct").lower()
+    return UnrestrictedLink(url=final_url, filename=filename, host=host, size=size)
+
+
+async def resolve_link(user_id: int, url: str) -> tuple[UnrestrictedLink, str]:
+    """Debrid primero; si falla, enlace directo solo si es un archivo real."""
+    url = normalize_mirrors(url)
+    try:
+        link, used = await unrestrict_url(user_id, url)
+        return link, used.name
+    except DebridError as debrid_exc:
+        log.info("Debrid no pudo desbloquear %s; probando descarga directa", url)
+        try:
+            link = await probe_direct_file(http, url)
+            return link, DIRECT_PROVIDER
+        except DirectDownloadError as direct_exc:
+            raise DebridError(
+                f"{debrid_exc}\n\n⬇️ Directo: {direct_exc}"
+            ) from direct_exc
 
 
 def providers_for_url(user_id: int, url: str) -> list[DebridProvider]:
@@ -238,6 +433,8 @@ HELP_TEXT = (
     "👋 **Bot Debrid**\n\n"
     "Envíame:\n"
     "• Un **enlace** de un hoster → lo desbloqueo y eliges: enlace directo o que te suba el archivo.\n"
+    "• Un **enlace directo** a un archivo (GitHub Releases, CDN, etc.) → si el debrid no lo "
+    "soporta, lo descargo yo (solo archivos reales, no páginas HTML).\n"
     "• Un **paste de controlc.com** → extraigo sus enlaces y los desbloqueo todos.\n"
     "• Una **carpeta de filecrypt.cc** → extraigo los enlaces y los desbloqueo. "
     "Si pide contraseña, mándala después del enlace. Con captcha se abre Chrome + uBlock.\n"
@@ -417,12 +614,14 @@ async def handle_text(_, message: Message):
     first = providers_for_url(message.from_user.id, url)[0]
     status = await message.reply_text(f"🔎 Desbloqueando con {first.name}...")
     try:
-        link, used = await unrestrict_url(message.from_user.id, url)
+        link, provider_name = await resolve_link(message.from_user.id, url)
     except DebridError as exc:
         await safe_edit(status, f"❌ {exc}")
         return
-    token = remember(link, used)
-    await safe_edit(status, describe(link, used.name), reply_markup=action_keyboard(token))
+    if provider_name == DIRECT_PROVIDER:
+        await safe_edit(status, "⬇️ Enlace directo detectado...")
+    token = remember(link, provider_name)
+    await safe_edit(status, describe(link, provider_name), reply_markup=action_keyboard(token))
 
 
 MAX_CONTAINER_LINKS = 20
@@ -442,12 +641,16 @@ async def unlock_many(
     unlocked = 0
     for raw_link in links[:MAX_CONTAINER_LINKS]:
         try:
-            link, used = await unrestrict_url(message.from_user.id, normalize_mirrors(raw_link))
+            link, provider_name = await resolve_link(
+                message.from_user.id, normalize_mirrors(raw_link)
+            )
         except DebridError as exc:
             await message.reply_text(f"❌ `{raw_link}`\n{exc}")
             continue
-        token = remember(link, used)
-        await message.reply_text(describe(link, used.name), reply_markup=action_keyboard(token))
+        token = remember(link, provider_name)
+        await message.reply_text(
+            describe(link, provider_name), reply_markup=action_keyboard(token)
+        )
         unlocked += 1
     summary = f"{emoji} {label}: {unlocked}/{total} enlace(s) desbloqueado(s)."
     if len(links) > MAX_CONTAINER_LINKS:
@@ -641,7 +844,14 @@ async def on_callback(client: Client, query: CallbackQuery):
             await query.message.edit_reply_markup(None)
         except Exception:
             pass
-        spawn(transfer(client, query.message, link))
+        spawn(
+            transfer(
+                client,
+                query.message,
+                link,
+                session=http if provider_name == DIRECT_PROVIDER else debrid_http,
+            )
+        )
 
 
 async def handle_torrent_callback(query: CallbackQuery, action: str, value: str):
@@ -729,11 +939,16 @@ async def handle_torrent_callback(query: CallbackQuery, action: str, value: str)
 
 # ---------------------------------------------------------------- transferencia
 
-async def transfer(client: Client, message: Message, link: UnrestrictedLink):
+async def transfer(
+    client: Client,
+    message: Message,
+    link: UnrestrictedLink,
+    session: aiohttp.ClientSession | None = None,
+):
     progress = await message.reply_text("⬇️ Descargando...")
     path = None
     try:
-        path = await download_file(link, progress)
+        path = await download_file(link, progress, session=session or debrid_http)
         await upload_to_telegram(client, message.chat.id, path, link, progress)
         await progress.delete()
     except FileTooLarge as exc:
@@ -750,12 +965,24 @@ async def transfer(client: Client, message: Message, link: UnrestrictedLink):
             os.remove(path)
 
 
-async def download_file(link: UnrestrictedLink, progress: Message) -> str:
+async def download_file(
+    link: UnrestrictedLink,
+    progress: Message,
+    session: aiohttp.ClientSession | None = None,
+) -> str:
+    session = session or debrid_http
     os.makedirs(cfg.download_dir, exist_ok=True)
     path = os.path.join(cfg.download_dir, f"{uuid.uuid4().hex[:8]}_{safe_filename(link.filename)}")
     last_edit = 0.0
-    async with debrid_http.get(link.url) as resp:
+    headers = {"User-Agent": DIRECT_USER_AGENT} if session is http else None
+    async with session.get(link.url, headers=headers) as resp:
         resp.raise_for_status()
+        # si el servidor sirve HTML al descargar (anti-hotlink), abortar
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype in _PAGE_CONTENT_TYPES:
+            raise DirectDownloadError(
+                f"El servidor devolvió HTML en lugar del archivo ({ctype})"
+            )
         total = int(resp.headers.get("Content-Length") or 0) or (link.size or 0)
         if total > MAX_TG_SIZE:
             raise FileTooLarge(total)
