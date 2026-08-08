@@ -28,6 +28,7 @@ from filecrypt import (
     get_folder_links,
     is_filecrypt,
 )
+import ytdlp as ytdlp_mod
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -56,6 +57,8 @@ link_proxy: LinkProxy | None = None
 providers: dict[str, DebridProvider] = {}
 user_service: dict[int, str] = {}
 pending: dict[str, tuple[UnrestrictedLink, str]] = {}
+# token -> MediaProbe (menú de calidades yt-dlp, estilo utube-bot)
+pending_ytdlp: dict[str, ytdlp_mod.MediaProbe] = {}
 
 # asyncio solo guarda referencias débiles a las tareas: sin esto el GC puede
 # matar un monitor_torrent/transfer en marcha y el mensaje se queda congelado
@@ -65,6 +68,7 @@ MAX_TG_SIZE = 2 * 1024**3  # límite de subida para bots (2 GB)
 MAX_TORRENT_FILES = 25
 STATUS_EMOJI = {"queued": "🕓", "downloading": "⬇️", "ready": "✅", "error": "❌"}
 DIRECT_PROVIDER = "Directo"
+YTDLP_PROVIDER = ytdlp_mod.PROVIDER_NAME
 DIRECT_USER_AGENT = (
     "Mozilla/5.0 (compatible; DebridBot/1.0; +https://github.com/Oihalitz/DebridBot)"
 )
@@ -329,21 +333,41 @@ async def probe_direct_file(session: aiohttp.ClientSession, url: str) -> Unrestr
     return UnrestrictedLink(url=final_url, filename=filename, host=host, size=size)
 
 
-async def resolve_link(user_id: int, url: str) -> tuple[UnrestrictedLink, str]:
-    """Debrid primero; si falla, enlace directo solo si es un archivo real."""
+async def resolve_link(
+    user_id: int, url: str, *, allow_ytdlp: bool = True
+) -> tuple[UnrestrictedLink, str]:
+    """Debrid → archivo directo → yt-dlp (si YTDLP=true y allow_ytdlp).
+
+    En mensajes sueltos se usa allow_ytdlp=False y luego el menú de calidades.
+    En lotes (paste/filecrypt) se deja allow_ytdlp=True con la calidad por defecto.
+    """
     url = normalize_mirrors(url)
-    try:
-        link, used = await unrestrict_url(user_id, url)
-        return link, used.name
-    except DebridError as debrid_exc:
-        log.info("Debrid no pudo desbloquear %s; probando descarga directa", url)
+    errors: list[str] = []
+
+    if providers:
         try:
-            link = await probe_direct_file(http, url)
-            return link, DIRECT_PROVIDER
-        except DirectDownloadError as direct_exc:
-            raise DebridError(
-                f"{debrid_exc}\n\n⬇️ Directo: {direct_exc}"
-            ) from direct_exc
+            link, used = await unrestrict_url(user_id, url)
+            return link, used.name
+        except DebridError as debrid_exc:
+            log.info("Debrid no pudo desbloquear %s; probando fallbacks", url)
+            errors.append(str(debrid_exc))
+
+    try:
+        link = await probe_direct_file(http, url)
+        return link, DIRECT_PROVIDER
+    except DirectDownloadError as direct_exc:
+        log.info("Descarga directa no válida para %s: %s", url, direct_exc)
+        errors.append(f"⬇️ Directo: {direct_exc}")
+
+    if allow_ytdlp and cfg.ytdlp:
+        try:
+            link = await ytdlp_mod.extract(url, cfg.ytdlp_format)
+            return link, YTDLP_PROVIDER
+        except ytdlp_mod.YtDlpError as ytdlp_exc:
+            log.info("yt-dlp no pudo extraer %s: %s", url, ytdlp_exc)
+            errors.append(f"🎬 yt-dlp: {ytdlp_exc}")
+
+    raise DebridError("\n\n".join(errors) if errors else "No se pudo resolver el enlace")
 
 
 def providers_for_url(user_id: int, url: str) -> list[DebridProvider]:
@@ -389,6 +413,17 @@ def describe(link: UnrestrictedLink, provider_name: str) -> str:
     lines = [f"📄 **Archivo:** {link.filename}", f"🌐 **Host:** {link.host}"]
     if link.size:
         lines.append(f"📦 **Tamaño:** {human_size(link.size)}")
+    if link.format_selector and provider_name == YTDLP_PROVIDER:
+        # muestra algo legible si es una altura concreta
+        sel = link.format_selector
+        if "height=" in sel:
+            m = re.search(r"height=(\d+)", sel)
+            if m:
+                lines.append(f"📺 **Calidad:** {m.group(1)}p")
+        elif sel in ("ba/b", "bestaudio/best"):
+            lines.append("📺 **Calidad:** solo audio")
+        elif sel in ("bv*+ba/b", "best"):
+            lines.append("📺 **Calidad:** mejor")
     lines.append(f"⚙️ **Servicio:** {provider_name}")
     return "\n".join(lines)
 
@@ -402,6 +437,36 @@ def action_keyboard(token: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def remember_ytdlp(media: ytdlp_mod.MediaProbe) -> str:
+    if len(pending_ytdlp) > 200:
+        for key in list(pending_ytdlp)[:50]:
+            pending_ytdlp.pop(key, None)
+    token = uuid.uuid4().hex[:12]
+    pending_ytdlp[token] = media
+    return token
+
+
+def quality_keyboard(token: str, options: list[ytdlp_mod.QualityOption]) -> InlineKeyboardMarkup:
+    """Botones de calidad en filas de 2 (estilo utube-bot)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for opt in options:
+        # callback_data max 64 bytes: yq:{12}:{key} cabe holgado
+        row.append(
+            InlineKeyboardButton(opt.label, callback_data=f"yq:{token}:{opt.key}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def ytdlp_format(link: UnrestrictedLink) -> str:
+    return link.format_selector or cfg.ytdlp_format
 
 
 def service_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -429,32 +494,46 @@ async def safe_edit(message: Message, text: str, **kwargs):
 
 # ---------------------------------------------------------------- comandos
 
-HELP_TEXT = (
-    "👋 **Bot Debrid**\n\n"
-    "Envíame:\n"
-    "• Un **enlace** de un hoster → lo desbloqueo y eliges: enlace directo o que te suba el archivo.\n"
-    "• Un **enlace directo** a un archivo (GitHub Releases, CDN, etc.) → si el debrid no lo "
-    "soporta, lo descargo yo (solo archivos reales, no páginas HTML).\n"
-    "• Un **paste de controlc.com** → extraigo sus enlaces y los desbloqueo todos.\n"
-    "• Una **carpeta de filecrypt.cc** → extraigo los enlaces y los desbloqueo. "
-    "Si pide contraseña, mándala después del enlace. Con captcha se abre Chrome + uBlock.\n"
-    "• Un **magnet** o un archivo **.torrent** → lo descargo en tu servicio debrid "
-    "y cuando termine te doy los archivos.\n\n"
-    "**Comandos:**\n"
-    "/service — elegir servicio debrid\n"
-    "/torrents — gestionar tus torrents: ver progreso, obtener enlaces, "
-    "reiniciar o eliminar\n"
-    "/help — esta ayuda"
-)
+def build_help_text() -> str:
+    lines = [
+        "👋 **Bot Debrid**\n",
+        "Envíame:",
+        "• Un **enlace** de un hoster → lo desbloqueo y eliges: enlace directo o que te suba el archivo.",
+        "• Un **enlace directo** a un archivo (GitHub Releases, CDN, etc.) → si el debrid no lo "
+        "soporta, lo descargo yo (solo archivos reales, no páginas HTML).",
+    ]
+    if cfg.ytdlp:
+        lines.append(
+            "• Un **vídeo** de YouTube, Vimeo y otros sitios soportados por **yt-dlp** → "
+            "elijo la **calidad** (1080p, 720p, audio…) y luego enlace o archivo."
+        )
+    lines.extend(
+        [
+            "• Un **paste de controlc.com** → extraigo sus enlaces y los desbloqueo todos.",
+            "• Una **carpeta de filecrypt.cc** → extraigo los enlaces y los desbloqueo. "
+            "Si pide contraseña, mándala después del enlace. Con captcha se abre Chrome + uBlock.",
+            "• Un **magnet** o un archivo **.torrent** → lo descargo en tu servicio debrid "
+            "y cuando termine te doy los archivos.\n",
+            "**Comandos:**",
+            "/service — elegir servicio debrid",
+            "/torrents — gestionar tus torrents: ver progreso, obtener enlaces, "
+            "reiniciar o eliminar",
+            "/help — esta ayuda",
+        ]
+    )
+    return "\n".join(lines)
 
 
 @app.on_message(filters.command(["start", "help"]) & filters.private & auth)
 async def cmd_start(_, message: Message):
-    await message.reply_text(HELP_TEXT)
+    await message.reply_text(build_help_text())
 
 
 @app.on_message(filters.command("service") & filters.private & auth)
 async def cmd_service(_, message: Message):
+    if not providers:
+        await message.reply_text("❌ No hay servicios debrid configurados.")
+        return
     await message.reply_text(
         "⚙️ Elige el servicio debrid activo:",
         reply_markup=service_keyboard(message.from_user.id),
@@ -560,6 +639,9 @@ async def torrent_detail_view(
 
 @app.on_message(filters.command("torrents") & filters.private & auth)
 async def cmd_torrents(_, message: Message):
+    if not providers:
+        await message.reply_text("❌ No hay servicios debrid configurados.")
+        return
     provider = provider_for(message.from_user.id)
     status = await message.reply_text(f"🔎 Consultando torrents en {provider.name}...")
     try:
@@ -578,6 +660,9 @@ async def handle_document(client: Client, message: Message):
     if not document.file_name or not document.file_name.lower().endswith(".torrent"):
         await message.reply_text("Solo acepto archivos `.torrent`.")
         return
+    if not providers:
+        await message.reply_text("❌ No hay servicios debrid configurados para torrents.")
+        return
     buffer = await client.download_media(message, in_memory=True)
     raw = bytes(buffer.getbuffer())
     provider = provider_for(message.from_user.id)
@@ -590,9 +675,12 @@ async def handle_text(_, message: Message):
     text = parts[0]
     if text.startswith("/"):
         return
-    provider = provider_for(message.from_user.id)
 
     if text.startswith("magnet:"):
+        if not providers:
+            await message.reply_text("❌ No hay servicios debrid configurados para torrents.")
+            return
+        provider = provider_for(message.from_user.id)
         await start_torrent(provider, message, magnet=message.text.strip())
         return
 
@@ -601,23 +689,58 @@ async def handle_text(_, message: Message):
         return
 
     if urlparse(text).netloc.endswith("controlc.com"):
+        if not providers:
+            await message.reply_text("❌ No hay servicios debrid configurados.")
+            return
+        provider = provider_for(message.from_user.id)
         await handle_paste(provider, message, text)
         return
 
     if is_filecrypt(text):
+        if not providers:
+            await message.reply_text("❌ No hay servicios debrid configurados.")
+            return
         # segunda palabra opcional = contraseña de la carpeta
         password = parts[1] if len(parts) > 1 else None
+        provider = provider_for(message.from_user.id)
         await handle_filecrypt(provider, message, text, password)
         return
 
     url = normalize_mirrors(text)
-    first = providers_for_url(message.from_user.id, url)[0]
-    status = await message.reply_text(f"🔎 Desbloqueando con {first.name}...")
+    if providers:
+        first = providers_for_url(message.from_user.id, url)[0]
+        status = await message.reply_text(f"🔎 Desbloqueando con {first.name}...")
+    else:
+        status = await message.reply_text("🔎 Procesando enlace...")
     try:
-        link, provider_name = await resolve_link(message.from_user.id, url)
-    except DebridError as exc:
-        await safe_edit(status, f"❌ {exc}")
+        # sin yt-dlp automático: si falla debrid/directo, menú de calidades
+        link, provider_name = await resolve_link(
+            message.from_user.id, url, allow_ytdlp=False
+        )
+    except DebridError as debrid_exc:
+        if not cfg.ytdlp:
+            await safe_edit(status, f"❌ {debrid_exc}")
+            return
+        await safe_edit(status, "🎬 Buscando calidades con yt-dlp...")
+        try:
+            media = await ytdlp_mod.probe(url)
+        except ytdlp_mod.YtDlpError as ytdlp_exc:
+            await safe_edit(
+                status,
+                f"❌ {debrid_exc}\n\n🎬 yt-dlp: {ytdlp_exc}",
+            )
+            return
+        if not media.options:
+            await safe_edit(status, f"❌ {debrid_exc}\n\n🎬 yt-dlp: sin formatos")
+            return
+        token = remember_ytdlp(media)
+        await safe_edit(
+            status,
+            ytdlp_mod.describe_media(media),
+            reply_markup=quality_keyboard(token, media.options),
+        )
         return
+
     if provider_name == DIRECT_PROVIDER:
         await safe_edit(status, "⬇️ Enlace directo detectado...")
     token = remember(link, provider_name)
@@ -815,15 +938,67 @@ async def on_callback(client: Client, query: CallbackQuery):
             pass
         return
 
+    # yq:token:quality_key — menú de calidades yt-dlp
+    if action == "yq":
+        token, _, qkey = value.partition(":")
+        media = pending_ytdlp.get(token)
+        if not media:
+            await query.answer("Este menú ha caducado, envía el enlace de nuevo.", show_alert=True)
+            return
+        option = next((o for o in media.options if o.key == qkey), None)
+        if not option:
+            await query.answer("Calidad no disponible.", show_alert=True)
+            return
+        await query.answer(option.label)
+        link = ytdlp_mod.link_from_probe(media, option)
+        # mantenemos el probe por si quiere volver atrás… pero simplificamos:
+        # pasamos a Enlace/Archivo y liberamos el menú de calidades
+        pending_ytdlp.pop(token, None)
+        action_token = remember(link, YTDLP_PROVIDER)
+        back_rows = action_keyboard(action_token).inline_keyboard
+        # botón para reabrir calidades si el probe aún… ya lo borramos; re-probe es caro
+        await safe_edit(
+            query.message,
+            describe(link, YTDLP_PROVIDER) + f"\n\n✅ Calidad: **{option.label}**",
+            reply_markup=InlineKeyboardMarkup(back_rows),
+        )
+        return
+
     if action in ("link", "file"):
         entry = pending.get(value)
         if not entry:
             await query.answer("Este enlace ha caducado, envíalo de nuevo.", show_alert=True)
             return
         link, provider_name = entry
+        is_ytdlp = provider_name == YTDLP_PROVIDER or link.via == "ytdlp"
 
         if action == "link":
             await query.answer()
+            if is_ytdlp:
+                await safe_edit(
+                    query.message,
+                    describe(link, provider_name) + "\n\n🎬 Obteniendo URL directa...",
+                )
+                try:
+                    direct = await ytdlp_mod.stream_url(
+                        link.url, ytdlp_format(link)
+                    )
+                except ytdlp_mod.YtDlpError as exc:
+                    await safe_edit(
+                        query.message,
+                        describe(link, provider_name)
+                        + f"\n\n❌ No hay URL directa usable: {exc}\n"
+                        "Prueba la opción **📤 Archivo**.",
+                    )
+                    return
+                await safe_edit(
+                    query.message,
+                    describe(link, provider_name)
+                    + f"\n\n🔗 [Descargar]({direct})\n\n"
+                    "_URL temporal de la plataforma; puede caducar. "
+                    "Para HLS/DASH usa 📤 Archivo._",
+                )
+                return
             await safe_edit(
                 query.message,
                 describe(link, provider_name) + f"\n\n🔗 [Descargar]({public_url(link)})",
@@ -832,11 +1007,21 @@ async def on_callback(client: Client, query: CallbackQuery):
 
         if link.size and link.size > MAX_TG_SIZE:
             await query.answer()
-            await safe_edit(
-                query.message,
-                describe(link, provider_name)
-                + f"\n\n❌ Supera el límite de 2 GB de Telegram.\n🔗 [Descargar]({public_url(link)})",
+            size_note = (
+                f"\n\n❌ Supera el límite de 2 GB de Telegram."
+                if not is_ytdlp
+                else f"\n\n❌ El tamaño estimado ({human_size(link.size)}) supera el límite "
+                "de 2 GB de Telegram."
             )
+            if is_ytdlp:
+                await safe_edit(query.message, describe(link, provider_name) + size_note)
+            else:
+                await safe_edit(
+                    query.message,
+                    describe(link, provider_name)
+                    + size_note
+                    + f"\n🔗 [Descargar]({public_url(link)})",
+                )
             return
 
         await query.answer("Preparando la transferencia...")
@@ -850,6 +1035,7 @@ async def on_callback(client: Client, query: CallbackQuery):
                 query.message,
                 link,
                 session=http if provider_name == DIRECT_PROVIDER else debrid_http,
+                via_ytdlp=is_ytdlp,
             )
         )
 
@@ -944,25 +1130,101 @@ async def transfer(
     message: Message,
     link: UnrestrictedLink,
     session: aiohttp.ClientSession | None = None,
+    via_ytdlp: bool = False,
 ):
     progress = await message.reply_text("⬇️ Descargando...")
     path = None
     try:
-        path = await download_file(link, progress, session=session or debrid_http)
+        if via_ytdlp:
+            path = await download_with_ytdlp(link, progress)
+        else:
+            path = await download_file(link, progress, session=session or debrid_http)
+        # si yt-dlp renombró el archivo, reflejarlo en la subida
+        final_name = os.path.basename(path)
+        if via_ytdlp and final_name and final_name != link.filename:
+            # quita el prefijo uuid_ del outtmpl
+            display = re.sub(r"^[0-9a-f]{8}_", "", final_name, count=1)
+            link = UnrestrictedLink(
+                url=link.url,
+                filename=display or link.filename,
+                host=link.host,
+                size=link.size,
+                via=link.via,
+                format_selector=link.format_selector,
+            )
         await upload_to_telegram(client, message.chat.id, path, link, progress)
         await progress.delete()
     except FileTooLarge as exc:
+        extra = ""
+        if not via_ytdlp:
+            extra = f"\n🔗 [Descargar]({public_url(link)})"
         await safe_edit(
             progress,
-            f"❌ El archivo pesa {human_size(exc.size)} y supera el límite de 2 GB.\n"
-            f"🔗 [Descargar]({public_url(link)})",
+            f"❌ El archivo pesa {human_size(exc.size)} y supera el límite de 2 GB."
+            + extra,
         )
+    except ytdlp_mod.YtDlpError as exc:
+        await safe_edit(progress, f"❌ yt-dlp: {exc}")
     except Exception as exc:
         log.exception("Error transfiriendo %s", link.filename)
         await safe_edit(progress, f"❌ Error en la transferencia: {exc}")
     finally:
         if path and os.path.exists(path):
             os.remove(path)
+
+
+async def download_with_ytdlp(link: UnrestrictedLink, progress: Message) -> str:
+    """Descarga con yt-dlp (soporta HLS/DASH y fusión vídeo+audio)."""
+    loop = asyncio.get_running_loop()
+    last_edit = [0.0]
+    # el hook corre en un hilo: encola ediciones en el loop del bot
+    pending_update: list[tuple[int, int] | None] = [None]
+    update_scheduled = [False]
+
+    async def flush_progress():
+        update_scheduled[0] = False
+        data = pending_update[0]
+        if not data:
+            return
+        downloaded, total = data
+        now = time.monotonic()
+        if now - last_edit[0] < 3:
+            return
+        last_edit[0] = now
+        if total:
+            pct = min(99.0, downloaded * 100 / total)
+            text = (
+                f"⬇️ yt-dlp · **{link.filename}**\n"
+                f"`[{progress_bar(pct)}]` {pct:.1f}% "
+                f"({human_size(downloaded)}/{human_size(total)})"
+            )
+        else:
+            text = (
+                f"⬇️ yt-dlp · **{link.filename}**\n"
+                f"Descargado: {human_size(downloaded)}"
+            )
+        await safe_edit(progress, text)
+
+    def on_progress(downloaded: int, total: int) -> None:
+        pending_update[0] = (downloaded, total)
+        if update_scheduled[0]:
+            return
+        update_scheduled[0] = True
+        loop.call_soon_threadsafe(lambda: spawn(flush_progress()))
+
+    await safe_edit(progress, f"⬇️ yt-dlp · **{link.filename}**\nPreparando...")
+    path = await ytdlp_mod.download(
+        link.url,
+        cfg.download_dir,
+        format_selector=ytdlp_format(link),
+        on_progress=on_progress,
+        max_filesize=MAX_TG_SIZE,
+    )
+    size = os.path.getsize(path)
+    if size > MAX_TG_SIZE:
+        os.remove(path)
+        raise FileTooLarge(size)
+    return path
 
 
 async def download_file(
@@ -1085,9 +1347,17 @@ async def main():
                 rule_host,
                 slug,
             )
-    if not providers:
+    if cfg.ytdlp:
+        if not ytdlp_mod.available():
+            raise SystemExit(
+                "YTDLP=true pero yt-dlp no está instalado. "
+                "Instálalo con: pip install yt-dlp"
+            )
+        log.info("yt-dlp activo (formato: %s)", cfg.ytdlp_format)
+    if not providers and not cfg.ytdlp:
         raise SystemExit(
-            "Configura al menos una API key: REALDEBRID_API_KEY, ALLDEBRID_API_KEY o TORBOX_API_KEY"
+            "Configura al menos una API key de debrid "
+            "(REALDEBRID_API_KEY, ALLDEBRID_API_KEY, …) o activa YTDLP=true"
         )
     await app.start()
     # menú de comandos de Telegram (autocompletado al escribir "/")
@@ -1099,11 +1369,10 @@ async def main():
         ]
     )
     me = await app.get_me()
-    log.info(
-        "Bot @%s iniciado. Servicios: %s",
-        me.username,
-        ", ".join(p.name for p in providers.values()),
-    )
+    services = ", ".join(p.name for p in providers.values()) or "(ninguno)"
+    if cfg.ytdlp:
+        services = f"{services}, yt-dlp" if providers else "yt-dlp"
+    log.info("Bot @%s iniciado. Servicios: %s", me.username, services)
     await idle()
     await app.stop()
     if link_proxy:

@@ -30,6 +30,8 @@ class Config:
     link_proxy_url: str | None
     host_rules: tuple[tuple[str, str], ...]
     failover: bool
+    ytdlp: bool
+    ytdlp_format: str
 
 
 def _env(name: str) -> str | None:
@@ -89,4 +91,7 @@ def load_config() -> Config:
         link_proxy_url=_env("LINK_PROXY_URL"),
         host_rules=tuple(rules),
         failover=(_env("FAILOVER") or "true").lower() in ("1", "true", "yes", "si", "sí"),
+        # Opcional: fallback con yt-dlp para YouTube, Vimeo, etc. (pip install yt-dlp)
+        ytdlp=(_env("YTDLP") or "").lower() in ("1", "true", "yes", "si", "sí"),
+        ytdlp_format=_env("YTDLP_FORMAT") or "bv*+ba/b",
     )

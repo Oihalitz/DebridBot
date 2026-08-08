@@ -16,6 +16,10 @@ class UnrestrictedLink:
     filename: str
     host: str
     size: int | None = None
+    # "ytdlp" = hay que bajar con yt-dlp (HLS/DASH, etc.), no con un GET simple
+    via: str | None = None
+    # selector de formato yt-dlp (p.ej. "bv*[height=720]+ba/b") si via=ytdlp
+    format_selector: str | None = None
 
 
 @dataclass

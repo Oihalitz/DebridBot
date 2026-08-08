@@ -16,6 +16,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 ARG INSTALL_BROWSER=false
 RUN if [ "$INSTALL_BROWSER" = "true" ]; then playwright install --with-deps chromium; fi
 
+# yt-dlp opcional (YouTube/Vimeo/…). Activa YTDLP=true en el .env.
+# ffmpeg permite fusionar vídeo+audio. Ejemplo:
+#   docker build --build-arg INSTALL_YTDLP=true -t debrid-bot .
+ARG INSTALL_YTDLP=false
+RUN if [ "$INSTALL_YTDLP" = "true" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends ffmpeg \
+      && rm -rf /var/lib/apt/lists/* \
+      && pip install --no-cache-dir yt-dlp; \
+    fi
+
 COPY . .
 
 # puerto del relay de enlaces (LINK_PROXY)

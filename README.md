@@ -18,6 +18,7 @@
 - 🎯 Per-hoster routing (`HOST_RULES`): pin a hoster to a specific service, e.g. `rapidgator:torbox` unlocks every rapidgator link with TorBox regardless of the active service.
 - 🛟 Automatic failover (`FAILOVER`, on by default): if the chosen service can't unlock a link, the bot silently tries your other configured services and answers with the first one that works.
 - 🔁 Optional link relay (`LINK_PROXY`): instead of the raw debrid URL you get a URL served by the bot itself (`http://bot_ip:8845/dl/…`), and the bot streams the file from the debrid. The debrid only ever sees one IP (the server's), which avoids "downloads from multiple IPs" bans when the bot runs on a VPS. Supports resume/Range. Remember to open the port.
+- 🎬 Optional **yt-dlp** fallback (`YTDLP=true`): if debrid and direct download fail, try [yt-dlp](https://github.com/yt-dlp/yt-dlp) (YouTube, Vimeo, and many other sites). Shows a **quality picker** (best / 1080p / 720p / audio…) then Link or File. Not installed by default — `pip install yt-dlp` (ffmpeg recommended for merging video+audio).
 
 ## Commands
 
@@ -45,6 +46,7 @@
    python3 -m venv .venv && source .venv/bin/activate
    pip install -r requirements.txt
    playwright install chromium   # o usa Google Chrome del sistema
+   # Opcional: YouTube/Vimeo/etc. → pip install yt-dlp  y YTDLP=true en .env
    python main.py
    ```
 
@@ -62,6 +64,7 @@ docker run -d --env-file .env -p 8845:8845 -v debrid_downloads:/app/downloads de
 
 - `-p 8845:8845` is only needed if you enable `LINK_PROXY`.
 - Add `--build-arg INSTALL_BROWSER=true` to bundle Playwright's Chromium (~700 MB extra) for filecrypt. Note that captcha-protected folders still need a display, so on a headless VPS they won't work either way — CNL2 folders (no captcha) work fine without the browser.
+- Add `--build-arg INSTALL_YTDLP=true` to install `yt-dlp` + `ffmpeg` in the image, then set `YTDLP=true` in `.env`.
 - The `.env` file is passed at runtime and never baked into the image.
 
 ## Project layout
@@ -71,6 +74,7 @@ main.py            # Telegram bot (handlers, progress, upload)
 config.py          # Configuration via environment variables / .env
 controlc.py        # controlc.com paste link extraction
 filecrypt.py       # filecrypt.cc (CNL2 + Chrome/uBlock for captcha)
+ytdlp.py           # optional yt-dlp fallback (YouTube, Vimeo, …)
 extensions/
   ublock/          # uBlock Origin (auto-downloaded if missing)
   fc-guard/        # closes ad popups

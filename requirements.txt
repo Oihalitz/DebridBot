@@ -6,3 +6,5 @@ python-dotenv>=1.2.2
 lxml>=5.0
 pycryptodome>=3.23.0
 playwright>=1.61.0
+# Opcional: descomenta o instala a mano si activas YTDLP=true
+# yt-dlp>=2025.1.26
