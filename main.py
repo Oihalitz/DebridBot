@@ -1369,6 +1369,22 @@ async def download_with_ytdlp(link: UnrestrictedLink, progress: Message) -> str:
         on_progress=on_progress,
         max_filesize=MAX_TG_SIZE,
     )
+    if cfg.ytdlp_reencode_h264:
+        try:
+            if ytdlp_mod.needs_h264_reencode(path):
+                await safe_edit(
+                    progress,
+                    f"🎬 Re-codificando a H.264 · **{link.filename}**\n"
+                    "Puede tardar (compatible QuickTime/Mac)…",
+                )
+            path = await ytdlp_mod.ensure_h264_aac(path)
+        except ytdlp_mod.YtDlpError:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
     size = os.path.getsize(path)
     if size > MAX_TG_SIZE:
         os.remove(path)
@@ -1502,7 +1518,16 @@ async def main():
                 "YTDLP=true pero yt-dlp no está instalado. "
                 "Instálalo con: pip install yt-dlp"
             )
-        log.info("yt-dlp activo (formato: %s)", cfg.ytdlp_format)
+        log.info(
+            "yt-dlp activo (formato: %s, reencode_h264: %s)",
+            cfg.ytdlp_format,
+            cfg.ytdlp_reencode_h264,
+        )
+        if cfg.ytdlp_reencode_h264 and not ytdlp_mod.ffmpeg_available():
+            log.warning(
+                "YTDLP_REENCODE_H264=true pero no hay ffmpeg/ffprobe en PATH; "
+                "la re-codificación fallará al descargar. Instala ffmpeg."
+            )
     if cfg.dripfiles:
         log.info("DripFiles activo (API free, sin key)")
     if not providers and not cfg.ytdlp:

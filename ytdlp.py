@@ -2,14 +2,20 @@
 
 No es dependencia obligatoria: solo se usa si YTDLP=true y el paquete está
 instalado (`pip install yt-dlp`). Para unir vídeo+audio conviene tener ffmpeg.
+
+Si YTDLP_REENCODE_H264=true (por defecto), tras descargar se re-codifica a
+H.264 + AAC en MP4 cuando el archivo no es ya compatible con QuickTime.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable
@@ -23,6 +29,16 @@ PROVIDER_NAME = "yt-dlp"
 
 # Alturas típicas que se ofrecen en el menú (estilo utube-bot)
 _QUALITY_HEIGHTS = (2160, 1440, 1080, 720, 480, 360, 240, 144)
+
+# Extensiones que tratamos como solo-audio (no re-encode a H.264)
+_AUDIO_EXTS = frozenset(
+    {".m4a", ".mp3", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac", ".wma"}
+)
+
+# CRF / preset razonables: calidad buena sin tardar eternidades en CPU
+_H264_CRF = "23"
+_H264_PRESET = "fast"
+_AAC_BITRATE = "192k"
 
 
 class YtDlpError(Exception):
@@ -56,6 +72,10 @@ def available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def ffmpeg_available() -> bool:
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def _safe_filename(name: str) -> str:
@@ -419,6 +439,214 @@ def _stream_url_sync(url: str, format_selector: str) -> str:
     raise YtDlpError(
         "No hay una URL directa usable (stream segmentado). Usa la opción 📤 Archivo."
     )
+
+
+def _probe_codecs(path: str) -> tuple[str | None, str | None]:
+    """Devuelve (vcodec, acodec) en minúsculas, o None si no hay ese stream."""
+    if not shutil.which("ffprobe"):
+        return None, None
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("ffprobe falló en %s: %s", path, exc)
+        return None, None
+    if proc.returncode != 0:
+        log.warning("ffprobe error en %s: %s", path, (proc.stderr or "").strip())
+        return None, None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return None, None
+    vcodec = acodec = None
+    for stream in data.get("streams") or []:
+        ctype = (stream.get("codec_type") or "").lower()
+        name = (stream.get("codec_name") or "").lower() or None
+        if ctype == "video" and vcodec is None and name not in ("mjpeg", "png", "bmp"):
+            vcodec = name
+        elif ctype == "audio" and acodec is None:
+            acodec = name
+    return vcodec, acodec
+
+
+def _is_h264(vcodec: str | None) -> bool:
+    if not vcodec:
+        return False
+    return vcodec in ("h264", "avc", "avc1") or vcodec.startswith("avc")
+
+
+def _is_aac(acodec: str | None) -> bool:
+    if not acodec:
+        return True  # sin audio: OK
+    return acodec in ("aac", "mp4a") or acodec.startswith("mp4a")
+
+
+def needs_h264_reencode(path: str) -> bool:
+    """True si el archivo tiene vídeo y no es ya H.264+AAC en un .mp4 usable."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _AUDIO_EXTS:
+        return False
+    vcodec, acodec = _probe_codecs(path)
+    if vcodec is None and acodec is not None:
+        # solo audio empaquetado como mp4/mkv/webm
+        return False
+    if vcodec is None:
+        # probe falló del todo: re-encodear solo si parece un contenedor de vídeo
+        return ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".flv")
+    if not _is_h264(vcodec):
+        return True
+    if not _is_aac(acodec):
+        return True
+    # H.264+AAC pero contenedor raro → remux a mp4
+    if ext not in (".mp4", ".m4v", ".mov"):
+        return True
+    return False
+
+
+def reencode_to_h264(path: str) -> str:
+    """Re-codifica (o remuxea) a H.264 + AAC en .mp4. Sustituye el archivo original.
+
+    - Si ya es H.264+AAC en MP4: no-op.
+    - Si es H.264 pero audio no AAC: copia vídeo y re-codifica audio.
+    - Si el vídeo no es H.264: re-codifica todo.
+    - Solo-audio: no-op.
+    """
+    if not os.path.isfile(path):
+        raise YtDlpError(f"Archivo no encontrado para re-encode: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _AUDIO_EXTS:
+        return path
+
+    if not ffmpeg_available():
+        raise YtDlpError(
+            "YTDLP_REENCODE_H264=true requiere ffmpeg y ffprobe en el PATH "
+            "(brew install ffmpeg / apt install ffmpeg)"
+        )
+
+    if not needs_h264_reencode(path):
+        log.info("yt-dlp: ya es H.264+AAC, sin re-encode: %s", os.path.basename(path))
+        return path
+
+    vcodec, acodec = _probe_codecs(path)
+    base, _ = os.path.splitext(path)
+    out_path = f"{base}.h264.mp4"
+    # evitar colisión
+    if os.path.exists(out_path):
+        out_path = f"{base}.{uuid.uuid4().hex[:6]}.h264.mp4"
+
+    video_copy = _is_h264(vcodec)
+    audio_copy = bool(acodec) and _is_aac(acodec)
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", path]
+    if video_copy:
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            _H264_PRESET,
+            "-crf",
+            _H264_CRF,
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    if acodec is None:
+        cmd += ["-an"]
+    elif audio_copy:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", _AAC_BITRATE]
+    # un solo par v/a por defecto; faststart para streaming/QuickTime
+    cmd += ["-movflags", "+faststart", out_path]
+
+    mode = "remux/copy" if video_copy and (audio_copy or acodec is None) else "re-encode"
+    if video_copy and not audio_copy and acodec is not None:
+        mode = "audio→AAC"
+    elif not video_copy:
+        mode = "H.264+AAC"
+    log.info(
+        "yt-dlp: %s → MP4 (%s) v=%s a=%s",
+        mode,
+        os.path.basename(path),
+        vcodec,
+        acodec,
+    )
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600 * 6,  # vídeos largos
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        raise YtDlpError("Timeout re-codificando a H.264") from exc
+    except OSError as exc:
+        raise YtDlpError(f"No se pudo ejecutar ffmpeg: {exc}") from exc
+
+    if proc.returncode != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        err = (proc.stderr or proc.stdout or "ffmpeg falló").strip()
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        raise YtDlpError(f"Re-encode H.264 falló: {err.splitlines()[-1] if err else 'error'}")
+
+    # sustituir original por el .mp4 final
+    final = f"{base}.mp4"
+    if os.path.abspath(final) == os.path.abspath(path):
+        # mismo nombre: borrar original y renombrar temporal
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        os.replace(out_path, final)
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            log.debug("no se pudo borrar original %s", path, exc_info=True)
+        if os.path.exists(final) and os.path.abspath(final) != os.path.abspath(out_path):
+            try:
+                os.remove(final)
+            except OSError:
+                pass
+        os.replace(out_path, final)
+
+    log.info(
+        "yt-dlp: re-encode listo → %s (%s bytes)",
+        os.path.basename(final),
+        os.path.getsize(final),
+    )
+    return final
+
+
+async def ensure_h264_aac(path: str) -> str:
+    """Versión async de reencode_to_h264 (hilo de fondo)."""
+    return await asyncio.to_thread(reencode_to_h264, path)
 
 
 def _download_sync(

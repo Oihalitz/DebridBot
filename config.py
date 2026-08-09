@@ -32,6 +32,8 @@ class Config:
     failover: bool
     ytdlp: bool
     ytdlp_format: str
+    # re-codificar vídeos yt-dlp a H.264+AAC (QuickTime / Mac); por defecto activo
+    ytdlp_reencode_h264: bool
     dripfiles: bool
     # plantilla del mensaje/descripción en DripFiles; placeholders: {filename} {host} {size}
     dripfiles_message: str
@@ -97,6 +99,9 @@ def load_config() -> Config:
         # Opcional: fallback con yt-dlp para YouTube, Vimeo, etc. (pip install yt-dlp)
         ytdlp=(_env("YTDLP") or "").lower() in ("1", "true", "yes", "si", "sí"),
         ytdlp_format=_env("YTDLP_FORMAT") or "bv*+ba/b",
+        # Por defecto true: tras descargar, re-codifica a H.264+AAC si hace falta (ffmpeg).
+        ytdlp_reencode_h264=(_env("YTDLP_REENCODE_H264") or "true").lower()
+        in ("1", "true", "yes", "si", "sí"),
         # Subir a DripFiles (API free, sin key). Por defecto activo.
         dripfiles=(_env("DRIPFILES") or "true").lower() in ("1", "true", "yes", "si", "sí"),
         dripfiles_message=_env("DRIPFILES_MESSAGE")
