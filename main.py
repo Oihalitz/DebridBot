@@ -28,6 +28,7 @@ from filecrypt import (
     get_folder_links,
     is_filecrypt,
 )
+import dripfiles as dripfiles_mod
 import ytdlp as ytdlp_mod
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -429,14 +430,20 @@ def describe(link: UnrestrictedLink, provider_name: str) -> str:
 
 
 def action_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+    row = [
+        InlineKeyboardButton("🔗 Enlace", callback_data=f"link:{token}"),
+        InlineKeyboardButton("📤 Archivo", callback_data=f"file:{token}"),
+    ]
+    rows = [row]
+    if cfg.dripfiles:
+        rows.append(
             [
-                InlineKeyboardButton("🔗 Enlace", callback_data=f"link:{token}"),
-                InlineKeyboardButton("📤 Archivo", callback_data=f"file:{token}"),
+                InlineKeyboardButton(
+                    "💧 DripFiles", callback_data=f"drip:{token}"
+                )
             ]
-        ]
-    )
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def remember_ytdlp(media: ytdlp_mod.MediaProbe) -> str:
@@ -506,6 +513,11 @@ def build_help_text() -> str:
         lines.append(
             "• Un **vídeo** de YouTube, Vimeo y otros sitios soportados por **yt-dlp** → "
             "elijo la **calidad** (1080p, 720p, audio…) y luego enlace o archivo."
+        )
+    if cfg.dripfiles:
+        lines.append(
+            "• Tras desbloquear: **💧 DripFiles** sube el archivo a "
+            "[dripfiles.com](https://dripfiles.com) (API free, enlace ~2 días)."
         )
     lines.extend(
         [
@@ -964,7 +976,7 @@ async def on_callback(client: Client, query: CallbackQuery):
         )
         return
 
-    if action in ("link", "file"):
+    if action in ("link", "file", "drip"):
         entry = pending.get(value)
         if not entry:
             await query.answer("Este enlace ha caducado, envíalo de nuevo.", show_alert=True)
@@ -988,7 +1000,7 @@ async def on_callback(client: Client, query: CallbackQuery):
                         query.message,
                         describe(link, provider_name)
                         + f"\n\n❌ No hay URL directa usable: {exc}\n"
-                        "Prueba la opción **📤 Archivo**.",
+                        "Prueba la opción **📤 Archivo** o **💧 DripFiles**.",
                     )
                     return
                 await safe_edit(
@@ -996,7 +1008,7 @@ async def on_callback(client: Client, query: CallbackQuery):
                     describe(link, provider_name)
                     + f"\n\n🔗 [Descargar]({direct})\n\n"
                     "_URL temporal de la plataforma; puede caducar. "
-                    "Para HLS/DASH usa 📤 Archivo._",
+                    "Para HLS/DASH usa 📤 Archivo o 💧 DripFiles._",
                 )
                 return
             await safe_edit(
@@ -1005,6 +1017,35 @@ async def on_callback(client: Client, query: CallbackQuery):
             )
             return
 
+        if action == "drip":
+            if not cfg.dripfiles:
+                await query.answer("DripFiles está desactivado.", show_alert=True)
+                return
+            if link.size and link.size > dripfiles_mod.MAX_SIZE:
+                await query.answer()
+                await safe_edit(
+                    query.message,
+                    describe(link, provider_name)
+                    + f"\n\n❌ El tamaño estimado ({human_size(link.size)}) supera "
+                    "el límite free de DripFiles (2 GB).",
+                )
+                return
+            await query.answer("Subiendo a DripFiles...")
+            try:
+                await query.message.edit_reply_markup(None)
+            except Exception:
+                pass
+            spawn(
+                transfer_to_dripfiles(
+                    query.message,
+                    link,
+                    session=http if provider_name == DIRECT_PROVIDER else debrid_http,
+                    via_ytdlp=is_ytdlp,
+                )
+            )
+            return
+
+        # action == "file"
         if link.size and link.size > MAX_TG_SIZE:
             await query.answer()
             size_note = (
@@ -1135,23 +1176,9 @@ async def transfer(
     progress = await message.reply_text("⬇️ Descargando...")
     path = None
     try:
-        if via_ytdlp:
-            path = await download_with_ytdlp(link, progress)
-        else:
-            path = await download_file(link, progress, session=session or debrid_http)
-        # si yt-dlp renombró el archivo, reflejarlo en la subida
-        final_name = os.path.basename(path)
-        if via_ytdlp and final_name and final_name != link.filename:
-            # quita el prefijo uuid_ del outtmpl
-            display = re.sub(r"^[0-9a-f]{8}_", "", final_name, count=1)
-            link = UnrestrictedLink(
-                url=link.url,
-                filename=display or link.filename,
-                host=link.host,
-                size=link.size,
-                via=link.via,
-                format_selector=link.format_selector,
-            )
+        path, link = await materialize_download(
+            link, progress, session=session, via_ytdlp=via_ytdlp
+        )
         await upload_to_telegram(client, message.chat.id, path, link, progress)
         await progress.delete()
     except FileTooLarge as exc:
@@ -1168,6 +1195,128 @@ async def transfer(
     except Exception as exc:
         log.exception("Error transfiriendo %s", link.filename)
         await safe_edit(progress, f"❌ Error en la transferencia: {exc}")
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+async def materialize_download(
+    link: UnrestrictedLink,
+    progress: Message,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    via_ytdlp: bool = False,
+) -> tuple[str, UnrestrictedLink]:
+    """Descarga el archivo a disco (debrid/directo o yt-dlp) y ajusta el nombre."""
+    if via_ytdlp:
+        path = await download_with_ytdlp(link, progress)
+    else:
+        path = await download_file(link, progress, session=session or debrid_http)
+    final_name = os.path.basename(path)
+    if via_ytdlp and final_name and final_name != link.filename:
+        display = re.sub(r"^[0-9a-f]{8}_", "", final_name, count=1)
+        link = UnrestrictedLink(
+            url=link.url,
+            filename=display or link.filename,
+            host=link.host,
+            size=link.size,
+            via=link.via,
+            format_selector=link.format_selector,
+        )
+    return path, link
+
+
+def _dripfiles_message(link: UnrestrictedLink, size: int | None = None) -> str:
+    """Construye el mensaje/descripción para la API free de DripFiles."""
+    template = cfg.dripfiles_message or "{filename}"
+    try:
+        return template.format(
+            filename=link.filename or "archivo",
+            host=link.host or "—",
+            size=human_size(size if size is not None else (link.size or 0)),
+        ).strip()
+    except (KeyError, ValueError) as exc:
+        log.warning("DRIPFILES_MESSAGE inválido (%s); uso solo el nombre", exc)
+        return link.filename or "archivo"
+
+
+async def transfer_to_dripfiles(
+    message: Message,
+    link: UnrestrictedLink,
+    session: aiohttp.ClientSession | None = None,
+    via_ytdlp: bool = False,
+):
+    """Descarga el archivo y lo sube a DripFiles; devuelve el enlace público."""
+    progress = await message.reply_text("⬇️ Descargando para DripFiles...")
+    path = None
+    try:
+        path, link = await materialize_download(
+            link, progress, session=session, via_ytdlp=via_ytdlp
+        )
+        size = os.path.getsize(path)
+        if size > dripfiles_mod.MAX_SIZE:
+            raise FileTooLarge(size)
+
+        last_edit = [0.0]
+
+        def on_progress(uploaded: int, total: int) -> None:
+            now = time.monotonic()
+            if now - last_edit[0] < 3 and uploaded < total:
+                return
+            last_edit[0] = now
+            if total:
+                pct = min(99.0, uploaded * 100 / total)
+                text = (
+                    f"💧 Subiendo a **DripFiles** · {link.filename}\n"
+                    f"`[{progress_bar(pct)}]` {pct:.1f}% "
+                    f"({human_size(uploaded)}/{human_size(total)})"
+                )
+            else:
+                text = (
+                    f"💧 Subiendo a **DripFiles** · {link.filename}\n"
+                    f"Subido: {human_size(uploaded)}"
+                )
+            spawn(safe_edit(progress, text))
+
+        await safe_edit(
+            progress,
+            f"💧 Subiendo a **DripFiles** · {link.filename}\nPreparando...",
+        )
+        drip_message = _dripfiles_message(link, size)
+        result = await dripfiles_mod.upload_path(
+            http,
+            path,
+            link.filename,
+            message=drip_message,
+            on_progress=on_progress,
+        )
+        url = result.get("url") or ""
+        expires = result.get("expires_at")
+        expire_note = ""
+        if isinstance(expires, (int, float)) and expires > 0:
+            # expires_at viene como unix; free = ~2 días
+            expire_note = "\n⏱ Caduca en ~2 días (plan free)."
+        msg_note = f"\n💬 {drip_message}" if drip_message else ""
+        await safe_edit(
+            progress,
+            describe(link, "DripFiles")
+            + f"\n\n💧 [Descargar en DripFiles]({url})"
+            + msg_note
+            + expire_note,
+        )
+    except FileTooLarge as exc:
+        await safe_edit(
+            progress,
+            f"❌ El archivo pesa {human_size(exc.size)} y supera el límite free "
+            "de DripFiles (2 GB).",
+        )
+    except dripfiles_mod.DripFilesError as exc:
+        await safe_edit(progress, f"❌ DripFiles: {exc}")
+    except ytdlp_mod.YtDlpError as exc:
+        await safe_edit(progress, f"❌ yt-dlp: {exc}")
+    except Exception as exc:
+        log.exception("Error subiendo a DripFiles %s", link.filename)
+        await safe_edit(progress, f"❌ Error subiendo a DripFiles: {exc}")
     finally:
         if path and os.path.exists(path):
             os.remove(path)
@@ -1354,6 +1503,8 @@ async def main():
                 "Instálalo con: pip install yt-dlp"
             )
         log.info("yt-dlp activo (formato: %s)", cfg.ytdlp_format)
+    if cfg.dripfiles:
+        log.info("DripFiles activo (API free, sin key)")
     if not providers and not cfg.ytdlp:
         raise SystemExit(
             "Configura al menos una API key de debrid "

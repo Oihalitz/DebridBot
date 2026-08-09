@@ -19,6 +19,7 @@
 - 🛟 Automatic failover (`FAILOVER`, on by default): if the chosen service can't unlock a link, the bot silently tries your other configured services and answers with the first one that works.
 - 🔁 Optional link relay (`LINK_PROXY`): instead of the raw debrid URL you get a URL served by the bot itself (`http://bot_ip:8845/dl/…`), and the bot streams the file from the debrid. The debrid only ever sees one IP (the server's), which avoids "downloads from multiple IPs" bans when the bot runs on a VPS. Supports resume/Range. Remember to open the port.
 - 🎬 Optional **yt-dlp** fallback (`YTDLP=true`): if debrid and direct download fail, try [yt-dlp](https://github.com/yt-dlp/yt-dlp) (YouTube, Vimeo, and many other sites). Shows a **quality picker** (best / 1080p / 720p / audio…) then Link or File. Not installed by default — `pip install yt-dlp` (ffmpeg recommended for merging video+audio).
+- 💧 **DripFiles** button (`DRIPFILES=true` by default): after unlocking, upload the file to [DripFiles](https://dripfiles.com) via their free public API (no key, ~2 GB, links expire in ~2 days) and get a share URL. Optional description via `DRIPFILES_MESSAGE` (`{filename}`, `{host}`, `{size}` → API field `message`).
 
 ## Commands
 
@@ -75,6 +76,7 @@ config.py          # Configuration via environment variables / .env
 controlc.py        # controlc.com paste link extraction
 filecrypt.py       # filecrypt.cc (CNL2 + Chrome/uBlock for captcha)
 ytdlp.py           # optional yt-dlp fallback (YouTube, Vimeo, …)
+dripfiles.py       # DripFiles free API client (upload + share link)
 extensions/
   ublock/          # uBlock Origin (auto-downloaded if missing)
   fc-guard/        # closes ad popups

@@ -32,6 +32,9 @@ class Config:
     failover: bool
     ytdlp: bool
     ytdlp_format: str
+    dripfiles: bool
+    # plantilla del mensaje/descripción en DripFiles; placeholders: {filename} {host} {size}
+    dripfiles_message: str
 
 
 def _env(name: str) -> str | None:
@@ -94,4 +97,8 @@ def load_config() -> Config:
         # Opcional: fallback con yt-dlp para YouTube, Vimeo, etc. (pip install yt-dlp)
         ytdlp=(_env("YTDLP") or "").lower() in ("1", "true", "yes", "si", "sí"),
         ytdlp_format=_env("YTDLP_FORMAT") or "bv*+ba/b",
+        # Subir a DripFiles (API free, sin key). Por defecto activo.
+        dripfiles=(_env("DRIPFILES") or "true").lower() in ("1", "true", "yes", "si", "sí"),
+        dripfiles_message=_env("DRIPFILES_MESSAGE")
+        or "{filename}\nHost: {host}\nTamaño: {size}",
     )
