@@ -19,7 +19,15 @@ from pyrogram.types import (
 
 from config import load_config
 from controlc import get_paste_links
-from debrid import DebridError, DebridProvider, UnrestrictedLink, build_providers
+from debrid import (
+    AdStreamProbe,
+    AllDebrid,
+    DebridError,
+    DebridProvider,
+    NeedsStreamChoice,
+    UnrestrictedLink,
+    build_providers,
+)
 from linkproxy import LinkProxy, detect_public_ip
 from filecrypt import (
     CaptchaRequired,
@@ -60,6 +68,15 @@ user_service: dict[int, str] = {}
 pending: dict[str, tuple[UnrestrictedLink, str]] = {}
 # token -> MediaProbe (menú de calidades yt-dlp, estilo utube-bot)
 pending_ytdlp: dict[str, ytdlp_mod.MediaProbe] = {}
+# token -> AdStreamProbe (menú de calidades AllDebrid streaming)
+pending_ad_streams: dict[str, AdStreamProbe] = {}
+
+# Sitios donde yt-dlp va primero (si YTDLP=true), antes que debrid
+_YTDLP_FIRST_HOST_SUFFIXES = (
+    "instagram.com",
+    "instagr.am",
+    "cdninstagram.com",
+)
 
 # asyncio solo guarda referencias débiles a las tareas: sin esto el GC puede
 # matar un monitor_torrent/transfer en marcha y el mensaje se queda congelado
@@ -334,21 +351,56 @@ async def probe_direct_file(session: aiohttp.ClientSession, url: str) -> Unrestr
     return UnrestrictedLink(url=final_url, filename=filename, host=host, size=size)
 
 
+def prefers_ytdlp_first(url: str) -> bool:
+    """Instagram y similares: yt-dlp antes que debrid (si YTDLP=true)."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if not host:
+        return False
+    for suffix in _YTDLP_FIRST_HOST_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return True
+    return False
+
+
 async def resolve_link(
-    user_id: int, url: str, *, allow_ytdlp: bool = True
+    user_id: int,
+    url: str,
+    *,
+    allow_ytdlp: bool = True,
+    auto_pick_stream: bool | None = None,
 ) -> tuple[UnrestrictedLink, str]:
-    """Debrid → archivo directo → yt-dlp (si YTDLP=true y allow_ytdlp).
+    """Orden por defecto: debrid → archivo directo → yt-dlp.
+
+    En Instagram (y hosts de `_YTDLP_FIRST_HOST_SUFFIXES`), si YTDLP=true y
+    allow_ytdlp, yt-dlp va **antes** del debrid.
 
     En mensajes sueltos se usa allow_ytdlp=False y luego el menú de calidades.
     En lotes (paste/filecrypt) se deja allow_ytdlp=True con la calidad por defecto.
+    auto_pick_stream: AllDebrid streaming elige la mejor calidad sin menú
+    (por defecto igual que allow_ytdlp).
     """
     url = normalize_mirrors(url)
     errors: list[str] = []
+    if auto_pick_stream is None:
+        auto_pick_stream = allow_ytdlp
+
+    # Instagram etc.: yt-dlp primero
+    if allow_ytdlp and cfg.ytdlp and prefers_ytdlp_first(url):
+        try:
+            link = await ytdlp_mod.extract(url, cfg.ytdlp_format)
+            return link, YTDLP_PROVIDER
+        except ytdlp_mod.YtDlpError as ytdlp_exc:
+            log.info("yt-dlp (preferido) no pudo extraer %s: %s", url, ytdlp_exc)
+            errors.append(f"🎬 yt-dlp: {ytdlp_exc}")
 
     if providers:
         try:
-            link, used = await unrestrict_url(user_id, url)
+            link, used = await unrestrict_url(
+                user_id, url, auto_pick_stream=auto_pick_stream
+            )
             return link, used.name
+        except NeedsStreamChoice:
+            raise
         except DebridError as debrid_exc:
             log.info("Debrid no pudo desbloquear %s; probando fallbacks", url)
             errors.append(str(debrid_exc))
@@ -360,13 +412,16 @@ async def resolve_link(
         log.info("Descarga directa no válida para %s: %s", url, direct_exc)
         errors.append(f"⬇️ Directo: {direct_exc}")
 
-    if allow_ytdlp and cfg.ytdlp:
+    if allow_ytdlp and cfg.ytdlp and not prefers_ytdlp_first(url):
         try:
             link = await ytdlp_mod.extract(url, cfg.ytdlp_format)
             return link, YTDLP_PROVIDER
         except ytdlp_mod.YtDlpError as ytdlp_exc:
             log.info("yt-dlp no pudo extraer %s: %s", url, ytdlp_exc)
             errors.append(f"🎬 yt-dlp: {ytdlp_exc}")
+    elif allow_ytdlp and cfg.ytdlp and prefers_ytdlp_first(url):
+        # ya se intentó al principio; no repetir
+        pass
 
     raise DebridError("\n\n".join(errors) if errors else "No se pudo resolver el enlace")
 
@@ -387,12 +442,22 @@ def providers_for_url(user_id: int, url: str) -> list[DebridProvider]:
     return ordered + [p for p in providers.values() if p not in ordered]
 
 
-async def unrestrict_url(user_id: int, url: str) -> tuple[UnrestrictedLink, DebridProvider]:
+async def unrestrict_url(
+    user_id: int, url: str, *, auto_pick_stream: bool = False
+) -> tuple[UnrestrictedLink, DebridProvider]:
     """Prueba los servicios en orden y devuelve el primero que desbloquee el enlace."""
     errors: list[str] = []
     for provider in providers_for_url(user_id, url):
         try:
+            if isinstance(provider, AllDebrid):
+                return (
+                    await provider.unrestrict(url, auto_pick_stream=auto_pick_stream),
+                    provider,
+                )
             return await provider.unrestrict(url), provider
+        except NeedsStreamChoice:
+            # el caller debe mostrar menú de calidades; no failover
+            raise
         except DebridError as exc:
             log.info("Failover: %s no desbloqueó %s (%s)", provider.name, url, exc)
             errors.append(str(exc))
@@ -455,8 +520,17 @@ def remember_ytdlp(media: ytdlp_mod.MediaProbe) -> str:
     return token
 
 
+def remember_ad_streams(probe: AdStreamProbe) -> str:
+    if len(pending_ad_streams) > 200:
+        for key in list(pending_ad_streams)[:50]:
+            pending_ad_streams.pop(key, None)
+    token = uuid.uuid4().hex[:12]
+    pending_ad_streams[token] = probe
+    return token
+
+
 def quality_keyboard(token: str, options: list[ytdlp_mod.QualityOption]) -> InlineKeyboardMarkup:
-    """Botones de calidad en filas de 2 (estilo utube-bot)."""
+    """Botones de calidad yt-dlp en filas de 2 (estilo utube-bot)."""
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for opt in options:
@@ -470,6 +544,37 @@ def quality_keyboard(token: str, options: list[ytdlp_mod.QualityOption]) -> Inli
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
+
+
+def ad_stream_keyboard(token: str, probe: AdStreamProbe) -> InlineKeyboardMarkup:
+    """Botones de calidad AllDebrid streaming (aq:token:stream_id)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for opt in probe.streams:
+        # stream ids tipo "137+140" → caben en 64 bytes con token de 12
+        sid = opt.id.replace(":", "_")
+        label = opt.label[:60] if len(opt.label) > 60 else opt.label
+        row.append(
+            InlineKeyboardButton(label, callback_data=f"aq:{token}:{sid}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def describe_ad_streams(probe: AdStreamProbe) -> str:
+    host = probe.host or probe.host_domain or "stream"
+    lines = [
+        f"🎬 **{probe.filename}**",
+        f"🌐 **{host}**",
+        f"⚙️ **Servicio:** AllDebrid",
+        "",
+        "Elige la **calidad** (stream AllDebrid):",
+    ]
+    return "\n".join(lines)
 
 
 def ytdlp_format(link: UnrestrictedLink) -> str:
@@ -719,18 +824,61 @@ async def handle_text(_, message: Message):
         return
 
     url = normalize_mirrors(text)
+    status: Message | None = None
+
+    # Instagram y similares: menú yt-dlp primero (si está habilitado)
+    if cfg.ytdlp and prefers_ytdlp_first(url):
+        status = await message.reply_text("🎬 Buscando calidades con yt-dlp...")
+        try:
+            media = await ytdlp_mod.probe(url)
+        except ytdlp_mod.YtDlpError as ytdlp_exc:
+            log.info("yt-dlp (preferido) falló para %s: %s; debrid", url, ytdlp_exc)
+            await safe_edit(
+                status,
+                f"🎬 yt-dlp no pudo (se prueba debrid)…\n`{ytdlp_exc}`",
+            )
+        else:
+            if media.options:
+                token = remember_ytdlp(media)
+                await safe_edit(
+                    status,
+                    ytdlp_mod.describe_media(media),
+                    reply_markup=quality_keyboard(token, media.options),
+                )
+                return
+            await safe_edit(status, "🎬 yt-dlp sin formatos; probando debrid…")
+
     if providers:
         first = providers_for_url(message.from_user.id, url)[0]
-        status = await message.reply_text(f"🔎 Desbloqueando con {first.name}...")
+        status_text = f"🔎 Desbloqueando con {first.name}..."
     else:
-        status = await message.reply_text("🔎 Procesando enlace...")
+        status_text = "🔎 Procesando enlace..."
+    if status is None:
+        status = await message.reply_text(status_text)
+    else:
+        await safe_edit(status, status_text)
+
     try:
-        # sin yt-dlp automático: si falla debrid/directo, menú de calidades
+        # sin yt-dlp automático aquí: si falla debrid/directo, menú de calidades
+        # (excepto Instagram, ya intentado arriba)
         link, provider_name = await resolve_link(
-            message.from_user.id, url, allow_ytdlp=False
+            message.from_user.id, url, allow_ytdlp=False, auto_pick_stream=False
         )
+    except NeedsStreamChoice as stream_exc:
+        probe = stream_exc.probe
+        token = remember_ad_streams(probe)
+        await safe_edit(
+            status,
+            describe_ad_streams(probe),
+            reply_markup=ad_stream_keyboard(token, probe),
+        )
+        return
     except DebridError as debrid_exc:
         if not cfg.ytdlp:
+            await safe_edit(status, f"❌ {debrid_exc}")
+            return
+        if prefers_ytdlp_first(url):
+            # ya se intentó yt-dlp al principio
             await safe_edit(status, f"❌ {debrid_exc}")
             return
         await safe_edit(status, "🎬 Buscando calidades con yt-dlp...")
@@ -973,6 +1121,56 @@ async def on_callback(client: Client, query: CallbackQuery):
             query.message,
             describe(link, YTDLP_PROVIDER) + f"\n\n✅ Calidad: **{option.label}**",
             reply_markup=InlineKeyboardMarkup(back_rows),
+        )
+        return
+
+    # aq:token:stream_id — menú de calidades AllDebrid streaming
+    if action == "aq":
+        token, _, stream_key = value.partition(":")
+        probe = pending_ad_streams.get(token)
+        if not probe:
+            await query.answer(
+                "Este menú ha caducado, envía el enlace de nuevo.", show_alert=True
+            )
+            return
+        # restaurar id por si sustituimos ":" al crear el botón
+        option = next(
+            (o for o in probe.streams if o.id == stream_key or o.id.replace(":", "_") == stream_key),
+            None,
+        )
+        if not option:
+            await query.answer("Calidad no disponible.", show_alert=True)
+            return
+        ad = providers.get(AllDebrid.slug)
+        if not isinstance(ad, AllDebrid):
+            await query.answer("AllDebrid no está configurado.", show_alert=True)
+            return
+        await query.answer(option.label)
+        await safe_edit(
+            query.message,
+            describe_ad_streams(probe)
+            + f"\n\n⏳ Generando **{option.label}**…",
+        )
+        try:
+            link = await ad.select_stream(
+                probe.unlock_id,
+                option.id,
+                filename=probe.filename,
+                host=probe.host or "stream",
+            )
+        except DebridError as exc:
+            await safe_edit(
+                query.message,
+                describe_ad_streams(probe) + f"\n\n❌ {exc}",
+                reply_markup=ad_stream_keyboard(token, probe),
+            )
+            return
+        pending_ad_streams.pop(token, None)
+        action_token = remember(link, ad.name)
+        await safe_edit(
+            query.message,
+            describe(link, ad.name) + f"\n\n✅ Calidad: **{option.label}**",
+            reply_markup=action_keyboard(action_token),
         )
         return
 

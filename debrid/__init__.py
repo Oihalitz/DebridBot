@@ -2,7 +2,12 @@ import aiohttp
 
 from config import Config
 
-from .alldebrid import AllDebrid
+from .alldebrid import (
+    AdStreamOption,
+    AdStreamProbe,
+    AllDebrid,
+    NeedsStreamChoice,
+)
 from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
 from .debridlink import DebridLink
 from .deepbrid import Deepbrid
@@ -13,6 +18,8 @@ from .realdebrid import RealDebrid
 from .torbox import TorBox
 
 __all__ = [
+    "AdStreamOption",
+    "AdStreamProbe",
     "AllDebrid",
     "DebridError",
     "DebridLink",
@@ -20,6 +27,7 @@ __all__ = [
     "Deepbrid",
     "Highway",
     "MegaDebrid",
+    "NeedsStreamChoice",
     "Premiumize",
     "RealDebrid",
     "TorBox",
