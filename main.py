@@ -107,6 +107,17 @@ _PAGE_CONTENT_TYPES = frozenset({
 _PAGE_EXTENSIONS = frozenset({
     ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".cgi", ".shtml",
 })
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+# Content-Types que mimetypes no conoce y que sí aparecen en hosters
+_CTYPE_EXTENSIONS = {
+    "application/x-zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+    "application/x-rar": ".rar",
+    "application/x-rar-compressed": ".rar",
+    "application/x-matroska": ".mkv",
+    "application/macbinary": "",  # genérico: no dice nada del contenido real
+    "binary/octet-stream": ".bin",
+}
 _CD_FILENAME_RE = re.compile(
     r"""filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)|filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;\s]+)""",
     re.I,
@@ -224,7 +235,20 @@ def filename_from_content_disposition(header: str | None) -> str | None:
     if not match:
         return None
     raw = next(g for g in match.groups() if g)
-    return safe_filename(unquote(raw.strip().strip('"')))
+    name = unquote(raw.strip().strip('"'))
+    # algunos servidores (DripFiles entre ellos) codifican el nombre dos veces:
+    # filename*=UTF-8''debuginfo%2520%25281%2529.zip → debuginfo (1).zip
+    if _PERCENT_ESCAPE_RE.search(name):
+        name = unquote(name)
+    return safe_filename(name)
+
+
+def extension_for(content_type: str | None) -> str:
+    """Extensión típica de un Content-Type, con los tipos raros más habituales."""
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if not ctype:
+        return ""
+    return _CTYPE_EXTENSIONS.get(ctype) or mimetypes.guess_extension(ctype) or ""
 
 
 def filename_from_url(url: str) -> str | None:
@@ -281,23 +305,33 @@ def is_downloadable_file(
 
 
 async def _probe_headers(
-    session: aiohttp.ClientSession, url: str, *, user_agent: str = DIRECT_USER_AGENT
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    user_agent: str = DIRECT_USER_AGENT,
+    use_head: bool = True,
 ) -> tuple[str, dict[str, str], int]:
-    """Devuelve (url_final, headers_lower, status). Prefiere HEAD; si falla, GET corto."""
+    """Devuelve (url_final, headers_lower, status). Prefiere HEAD; si falla, GET corto.
+
+    `use_head=False` va directo al GET: hay servidores que responden al HEAD con
+    la página web y al GET con el archivo (DripFiles lo hace), así que para el
+    modo wget solo vale lo que diga el GET.
+    """
     headers = {"User-Agent": user_agent, "Accept": "*/*"}
     timeout = aiohttp.ClientTimeout(total=30, connect=15, sock_read=20)
 
     try:
-        async with session.head(
-            url, headers=headers, allow_redirects=True, timeout=timeout
-        ) as resp:
-            if resp.status < 400:
-                return (
-                    str(resp.url),
-                    {k.lower(): v for k, v in resp.headers.items()},
-                    resp.status,
-                )
-            # 405/501 = HEAD no soportado; otros 4xx/5xx se reintentan con GET por si acaso
+        if use_head:
+            async with session.head(
+                url, headers=headers, allow_redirects=True, timeout=timeout
+            ) as resp:
+                if resp.status < 400:
+                    return (
+                        str(resp.url),
+                        {k.lower(): v for k, v in resp.headers.items()},
+                        resp.status,
+                    )
+                # 405/501 = HEAD no soportado; otros 4xx/5xx se reintentan con GET
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
 
@@ -399,7 +433,7 @@ async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> Unrestrict
     )
     try:
         final_url, hdrs, status = await _probe_headers(
-            session, url, user_agent=WGET_USER_AGENT
+            session, url, user_agent=WGET_USER_AGENT, use_head=False
         )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         # sin cabeceras seguimos igual: manda el GET de la descarga, que dirá la verdad
@@ -418,7 +452,7 @@ async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> Unrestrict
     )
     if "." not in filename:
         # sin extensión Telegram no sabe qué es; la deducimos del Content-Type
-        filename += mimetypes.guess_extension(content_type) or ""
+        filename += extension_for(content_type)
     size = None
     if "content-range" in hdrs:
         total = hdrs["content-range"].rsplit("/", 1)[-1]
@@ -800,8 +834,11 @@ async def cmd_wget(client: Client, message: Message):
         await status.delete()
     except Exception:
         pass
-    # session=http: es una descarga propia, no debe salir por DEBRID_PROXY
-    spawn(transfer(client, message, link, session=http, raw=True))
+    # session=http: es una descarga propia, no debe salir por DEBRID_PROXY.
+    # autoname: sin nombre pedido, el del servidor manda (el sondeo puede fallar)
+    spawn(
+        transfer(client, message, link, session=http, raw=True, autoname=not rename)
+    )
 
 
 TORRENTS_PAGE_SIZE = 8
@@ -1564,12 +1601,13 @@ async def transfer(
     session: aiohttp.ClientSession | None = None,
     via_ytdlp: bool = False,
     raw: bool = False,
+    autoname: bool = False,
 ):
     progress = await message.reply_text("⬇️ Descargando...")
     path = None
     try:
         path, link = await materialize_download(
-            link, progress, session=session, via_ytdlp=via_ytdlp, raw=raw
+            link, progress, session=session, via_ytdlp=via_ytdlp, raw=raw, autoname=autoname
         )
         await upload_to_telegram(client, message.chat.id, path, link, progress)
         await progress.delete()
@@ -1605,6 +1643,7 @@ async def materialize_download(
     session: aiohttp.ClientSession | None = None,
     via_ytdlp: bool = False,
     raw: bool = False,
+    autoname: bool = False,
 ) -> tuple[str, UnrestrictedLink]:
     """Descarga el archivo a disco (debrid/directo o yt-dlp) y ajusta el nombre."""
     if via_ytdlp:
@@ -1617,9 +1656,10 @@ async def materialize_download(
             allow_html=raw,
             # el modo wget se anuncia como wget también al descargar, no solo al sondear
             user_agent=WGET_USER_AGENT if raw else None,
+            name_from_response=autoname,
         )
     final_name = os.path.basename(path)
-    if via_ytdlp and final_name and final_name != link.filename:
+    if (via_ytdlp or autoname) and final_name and final_name != link.filename:
         display = re.sub(r"^[0-9a-f]{8}_", "", final_name, count=1)
         link = UnrestrictedLink(
             url=link.url,
@@ -1804,10 +1844,10 @@ async def download_file(
     session: aiohttp.ClientSession | None = None,
     allow_html: bool = False,
     user_agent: str | None = None,
+    name_from_response: bool = False,
 ) -> str:
     session = session or debrid_http
     os.makedirs(cfg.download_dir, exist_ok=True)
-    path = os.path.join(cfg.download_dir, f"{uuid.uuid4().hex[:8]}_{safe_filename(link.filename)}")
     last_edit = 0.0
     # con debrid_http manda la sesión (proxy y cabeceras propias del servicio)
     headers = (
@@ -1822,6 +1862,20 @@ async def download_file(
             raise DirectDownloadError(
                 f"El servidor devolvió HTML en lugar del archivo ({ctype})"
             )
+        filename = link.filename
+        if name_from_response:
+            # el sondeo puede haber visto otra cosa que el GET (HEAD ≠ GET en
+            # algunos hosters): para nombrar el archivo manda quien trae los bytes
+            filename = (
+                filename_from_content_disposition(resp.headers.get("Content-Disposition"))
+                or filename_from_url(str(resp.url))
+                or link.filename
+            )
+            if "." not in filename:
+                filename += extension_for(ctype)
+        path = os.path.join(
+            cfg.download_dir, f"{uuid.uuid4().hex[:8]}_{safe_filename(filename)}"
+        )
         total = int(resp.headers.get("Content-Length") or 0) or (link.size or 0)
         if total > MAX_TG_SIZE:
             raise FileTooLarge(total)
@@ -1838,7 +1892,7 @@ async def download_file(
                     pct = downloaded * 100 / total
                     await safe_edit(
                         progress,
-                        f"⬇️ Descargando **{link.filename}**\n"
+                        f"⬇️ Descargando **{filename}**\n"
                         f"`[{progress_bar(pct)}]` {pct:.1f}% "
                         f"({human_size(downloaded)}/{human_size(total)})",
                     )
