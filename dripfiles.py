@@ -1,22 +1,29 @@
 """Cliente de la API pública free de DripFiles (https://dripfiles.com/api/v1/free).
 
-Sin API key. Flujo:
+Subida (sin API key):
   1. POST /uploads              → upload_id + upload_token
   2. POST /uploads/{id}/files   → trozos multipart (files[]) + Content-Range
   3. POST /uploads/{id}/complete
   4. GET  /uploads/{id}         → poll hasta status=ready → url de descarga
 
-Límites free (aprox.): 2 GB total, 50 archivos, caduca en 2 días, 20 subidas/IP/hora.
+Descarga (`fetch_share`): la API de estado exige el upload_token, que solo tiene
+quien subió, así que para un envío ajeno se lee la página pública del envío y se
+sacan sus enlaces `handler/file`, que sí son descargables por cualquiera.
+
+Límites free (aprox.): 2 GB por archivo, 50 archivos, caduca en 2 días.
 """
 
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import logging
 import os
+import re
 import uuid
+from dataclasses import dataclass
 from typing import Callable
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
 
@@ -237,3 +244,161 @@ async def upload_path(
     status["url"] = url
     log.info("DripFiles listo: %s", url)
     return status
+
+
+# ------------------------------------------------------------------ descarga
+
+SHARE_HOSTS = ("dripfiles.com",)
+# rutas del sitio que no son envíos (evita tratarlas como enlaces de descarga)
+_RESERVED_PATHS = frozenset({
+    "api", "handler", "page", "assets", "login", "logout", "register",
+    "signup", "account", "admin", "premium", "terms", "privacy", "faq",
+    "hola", "index.php", "robots.txt", "favicon.ico",
+})
+_SHARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+# la web responde el archivo (o un zip con todo) cuando el User-Agent no parece
+# un navegador; con UA de navegador devuelve el HTML con los enlaces por archivo
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+_FILE_LINK_RE = re.compile(
+    r"handler/file\?file_id=(?P<id>\d+)&(?:amp;)?file_secret=(?P<secret>[0-9a-zA-Z]+)",
+    re.I,
+)
+_NAME_RE = re.compile(r'<span class="name">(.*?)</span>', re.I | re.S)
+# ventana de HTML tras un enlace donde buscar su nombre (el bloque de la tarjeta)
+_NAME_WINDOW = 4000
+
+
+@dataclass(frozen=True)
+class ShareFile:
+    """Un archivo descargable dentro de un envío público."""
+
+    name: str
+    url: str
+
+
+@dataclass(frozen=True)
+class Share:
+    """Envío público de DripFiles con sus archivos."""
+
+    upload_id: str
+    url: str
+    files: list[ShareFile]
+
+
+def is_share_url(url: str) -> bool:
+    """True si la URL es un envío de DripFiles (dripfiles.com/XXXXXXXX)."""
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if not any(host == h or host.endswith("." + h) for h in SHARE_HOSTS):
+        return False
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    if not parts or len(parts) > 2:
+        return False
+    if parts[0].lower() in _RESERVED_PATHS:
+        return False
+    return all(_SHARE_ID_RE.match(p) for p in parts)
+
+
+def share_id(url: str) -> str:
+    parts = [p for p in (urlparse(url).path or "").split("/") if p]
+    return parts[0] if parts else url
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def parse_share_html(html: str, base_url: str) -> list[ShareFile]:
+    """Saca los archivos (enlace + nombre) de la página pública de un envío."""
+    origin = _origin(base_url)
+    # cada tarjeta repite su enlace (vista previa, botón…): nos quedamos con la
+    # primera aparición de cada file_id y mantenemos el orden de la página
+    first: dict[str, tuple[str, int]] = {}
+    for match in _FILE_LINK_RE.finditer(html):
+        first.setdefault(match.group("id"), (match.group("secret"), match.start()))
+
+    entries = sorted(first.items(), key=lambda item: item[1][1])
+    files: list[ShareFile] = []
+    for index, (file_id, (secret, start)) in enumerate(entries):
+        # el nombre vive dentro del bloque de la tarjeta, entre este enlace y el siguiente
+        end = entries[index + 1][1][1] if index + 1 < len(entries) else len(html)
+        block = html[start : min(end, start + _NAME_WINDOW)]
+        name_match = _NAME_RE.search(block)
+        name = (
+            html_mod.unescape(name_match.group(1)).strip() if name_match else ""
+        ) or f"archivo_{file_id}"
+        files.append(
+            ShareFile(
+                name=name,
+                url=(
+                    f"{origin}/handler/file?file_id={file_id}"
+                    f"&file_secret={secret}&download=true"
+                ),
+            )
+        )
+    return files
+
+
+async def fetch_share(
+    session: aiohttp.ClientSession, url: str, *, timeout: float = 45
+) -> Share:
+    """Lee un envío público y devuelve sus archivos con enlaces directos."""
+    url = url.strip()
+    headers = {"User-Agent": _BROWSER_UA, "Accept": "text/html,*/*"}
+    client_timeout = aiohttp.ClientTimeout(total=timeout, connect=15, sock_read=30)
+    try:
+        async with session.get(
+            url, headers=headers, allow_redirects=True, timeout=client_timeout
+        ) as resp:
+            if resp.status == 404:
+                raise DripFilesError("el envío no existe o ha caducado")
+            if resp.status >= 400:
+                raise DripFilesError(f"la página del envío respondió HTTP {resp.status}")
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if "html" not in ctype:
+                # el servidor sirvió el archivo/zip directamente: no hay nada que parsear
+                name = _filename_from_disposition(
+                    resp.headers.get("Content-Disposition")
+                ) or f"{share_id(url)}.zip"
+                return Share(
+                    upload_id=share_id(url),
+                    url=url,
+                    files=[ShareFile(name=name, url=str(resp.url))],
+                )
+            body = await resp.text(errors="replace")
+            final_url = str(resp.url)
+    except aiohttp.ClientError as exc:
+        raise DripFilesError(f"no se pudo abrir el envío: {exc}") from exc
+    except asyncio.TimeoutError as exc:
+        raise DripFilesError("timeout abriendo el envío") from exc
+
+    files = parse_share_html(body, final_url)
+    if not files:
+        raise DripFilesError(
+            "no encontré archivos en ese envío (¿caducado, vacío o con contraseña?)"
+        )
+    log.info("DripFiles: %s archivo(s) en %s", len(files), url)
+    return Share(upload_id=share_id(url), url=url, files=files)
+
+
+_CD_FILENAME_RE = re.compile(
+    r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)|filename\s*=\s*\"([^\"]+)\"",
+    re.I,
+)
+
+
+def _filename_from_disposition(header: str | None) -> str | None:
+    match = _CD_FILENAME_RE.search(header or "")
+    if not match:
+        return None
+    raw = next(group for group in match.groups() if group)
+    return unquote(raw).strip() or None

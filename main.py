@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -86,7 +87,10 @@ MAX_TG_SIZE = 2 * 1024**3  # límite de subida para bots (2 GB)
 MAX_TORRENT_FILES = 25
 STATUS_EMOJI = {"queued": "🕓", "downloading": "⬇️", "ready": "✅", "error": "❌"}
 DIRECT_PROVIDER = "Directo"
+DRIPFILES_PROVIDER = "DripFiles"
 YTDLP_PROVIDER = ytdlp_mod.PROVIDER_NAME
+# servicios que se descargan con la sesión normal, no por el proxy del debrid
+LOCAL_PROVIDERS = (DIRECT_PROVIDER, DRIPFILES_PROVIDER)
 DIRECT_USER_AGENT = (
     "Mozilla/5.0 (compatible; DebridBot/1.0; +https://github.com/Oihalitz/DebridBot)"
 )
@@ -351,6 +355,74 @@ async def probe_direct_file(session: aiohttp.ClientSession, url: str) -> Unrestr
     return UnrestrictedLink(url=final_url, filename=filename, host=host, size=size)
 
 
+def session_for(provider_name: str) -> aiohttp.ClientSession:
+    """Enlaces propios (directo/DripFiles) van por la sesión normal; el resto por el debrid."""
+    return http if provider_name in LOCAL_PROVIDERS else debrid_http
+
+
+async def dripfiles_links(url: str) -> tuple[list[UnrestrictedLink], list[str], int]:
+    """Convierte un envío de DripFiles en enlaces descargables (uno por archivo).
+
+    Devuelve (enlaces, errores, total de archivos del envío). Se procesan como
+    mucho MAX_CONTAINER_LINKS archivos, igual que en pastes y carpetas.
+    """
+    share = await dripfiles_mod.fetch_share(http, url)
+    links: list[UnrestrictedLink] = []
+    errors: list[str] = []
+    for item in share.files[:MAX_CONTAINER_LINKS]:
+        try:
+            # el handler de DripFiles ya manda Content-Disposition y tamaño reales
+            links.append(await probe_direct_file(http, item.url))
+        except DirectDownloadError as exc:
+            log.info("DripFiles: %s no se pudo preparar (%s)", item.name, exc)
+            errors.append(f"`{item.name}`: {exc}")
+    return links, errors, len(share.files)
+
+
+async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> UnrestrictedLink:
+    """Como probe_direct_file pero sin filtros: lo que responda el servidor vale.
+
+    Es el modo `wget`: no se comprueba si parece un archivo (HTML incluido) y si
+    ni siquiera se pueden leer las cabeceras se sigue con el nombre de la URL.
+    """
+    url = normalize_github_url(url.strip())
+    blind = UnrestrictedLink(
+        url=url,
+        filename=filename_from_url(url) or f"archivo_{uuid.uuid4().hex[:8]}",
+        host=(urlparse(url).hostname or "direct").lower(),
+        size=None,
+    )
+    try:
+        final_url, hdrs, status = await _probe_headers(session, url)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # sin cabeceras seguimos igual: manda el GET de la descarga, que dirá la verdad
+        log.info("wget: no pude sondear %s (%s); descargo a ciegas", url, exc)
+        return blind
+    if status >= 400:
+        # puede ser el HEAD o el Range del sondeo, no la URL; que decida la descarga
+        log.info("wget: el sondeo de %s devolvió HTTP %s; descargo a ciegas", url, status)
+        return blind
+
+    content_type = (hdrs.get("content-type") or "").split(";")[0].strip().lower()
+    filename = (
+        filename_from_content_disposition(hdrs.get("content-disposition"))
+        or filename_from_url(final_url)
+        or f"archivo_{uuid.uuid4().hex[:8]}"
+    )
+    if "." not in filename:
+        # sin extensión Telegram no sabe qué es; la deducimos del Content-Type
+        filename += mimetypes.guess_extension(content_type) or ""
+    size = None
+    if "content-range" in hdrs:
+        total = hdrs["content-range"].rsplit("/", 1)[-1]
+        if total.isdigit():
+            size = int(total)
+    elif "content-length" in hdrs and hdrs["content-length"].isdigit():
+        size = int(hdrs["content-length"])
+    host = (urlparse(final_url).hostname or "direct").lower()
+    return UnrestrictedLink(url=final_url, filename=filename, host=host, size=size)
+
+
 def prefers_ytdlp_first(url: str) -> bool:
     """Instagram y similares: yt-dlp antes que debrid (si YTDLP=true)."""
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
@@ -383,6 +455,23 @@ async def resolve_link(
     errors: list[str] = []
     if auto_pick_stream is None:
         auto_pick_stream = allow_ytdlp
+
+    # envío de DripFiles: los enlaces por archivo salen de su página pública
+    if dripfiles_mod.is_share_url(url):
+        try:
+            links, drip_errors, total = await dripfiles_links(url)
+        except dripfiles_mod.DripFilesError as drip_exc:
+            raise DebridError(f"💧 DripFiles: {drip_exc}") from drip_exc
+        if total > 1:
+            raise DebridError(
+                f"💧 DripFiles: el envío tiene {total} archivos; "
+                "mándame el enlace suelto para elegir cuál quieres."
+            )
+        if not links:
+            raise DebridError(
+                "💧 DripFiles: " + ("\n".join(drip_errors) or "envío sin archivos")
+            )
+        return links[0], DRIPFILES_PROVIDER
 
     # Instagram etc.: yt-dlp primero
     if allow_ytdlp and cfg.ytdlp and prefers_ytdlp_first(url):
@@ -619,6 +708,10 @@ def build_help_text() -> str:
             "• Un **vídeo** de YouTube, Vimeo y otros sitios soportados por **yt-dlp** → "
             "elijo la **calidad** (1080p, 720p, audio…) y luego enlace o archivo."
         )
+    lines.append(
+        "• Un **envío de DripFiles** (`https://dripfiles.com/XXXXXXXX`) → te lo descargo; "
+        "si tiene varios archivos, eliges cuál."
+    )
     if cfg.dripfiles:
         lines.append(
             "• Tras desbloquear: **💧 DripFiles** sube el archivo a "
@@ -632,6 +725,8 @@ def build_help_text() -> str:
             "• Un **magnet** o un archivo **.torrent** → lo descargo en tu servicio debrid "
             "y cuando termine te doy los archivos.\n",
             "**Comandos:**",
+            "/wget `URL [nombre]` — descarga la URL **tal cual** (sin debrid ni "
+            "comprobaciones) y te la subo aquí; el nombre es opcional, como `wget -O`",
             "/service — elegir servicio debrid",
             "/torrents — gestionar tus torrents: ver progreso, obtener enlaces, "
             "reiniciar o eliminar",
@@ -655,6 +750,51 @@ async def cmd_service(_, message: Message):
         "⚙️ Elige el servicio debrid activo:",
         reply_markup=service_keyboard(message.from_user.id),
     )
+
+
+@app.on_message(filters.command("wget") & filters.private & auth)
+async def cmd_wget(client: Client, message: Message):
+    """/wget URL [nombre] — descarga la URL tal cual, sin debrid ni comprobaciones."""
+    parts = message.text.split(maxsplit=2)
+    url = parts[1].strip() if len(parts) > 1 else ""
+    if not is_url(url):
+        await message.reply_text(
+            "Uso: `/wget https://ejemplo.com/archivo.zip [nombre.ext]`\n\n"
+            "Descarga la URL tal cual (sin debrid, sin yt-dlp y sin comprobar si "
+            "«parece» un archivo) y te la subo aquí. El nombre es opcional, como `wget -O`."
+        )
+        return
+
+    rename = safe_filename(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else None
+    status = await message.reply_text("🔎 Comprobando la URL...")
+    try:
+        link = await probe_raw_file(http, url)
+    except DirectDownloadError as exc:
+        await safe_edit(status, f"❌ {exc}")
+        return
+    except Exception as exc:
+        log.exception("wget: no pude abrir %s", url)
+        await safe_edit(status, f"❌ No pude abrir la URL: {exc}")
+        return
+
+    if rename:
+        link = UnrestrictedLink(
+            url=link.url, filename=rename, host=link.host, size=link.size
+        )
+    if link.size and link.size > MAX_TG_SIZE:
+        await safe_edit(
+            status,
+            f"❌ **{link.filename}** pesa {human_size(link.size)} y supera "
+            "el límite de 2 GB de Telegram.",
+        )
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    # session=http: es una descarga propia, no debe salir por DEBRID_PROXY
+    spawn(transfer(client, message, link, session=http, raw=True))
 
 
 TORRENTS_PAGE_SIZE = 8
@@ -813,6 +953,10 @@ async def handle_text(_, message: Message):
         await handle_paste(provider, message, text)
         return
 
+    if dripfiles_mod.is_share_url(text):
+        await handle_dripfiles(message, text)
+        return
+
     if is_filecrypt(text):
         if not providers:
             await message.reply_text("❌ No hay servicios debrid configurados.")
@@ -938,6 +1082,48 @@ async def unlock_many(
     summary = f"{emoji} {label}: {unlocked}/{total} enlace(s) desbloqueado(s)."
     if len(links) > MAX_CONTAINER_LINKS:
         summary += f" (Había {len(links)}, procesados los primeros {MAX_CONTAINER_LINKS}.)"
+    await safe_edit(status, summary)
+
+
+async def handle_dripfiles(message: Message, url: str):
+    """Envío de DripFiles: lista sus archivos y ofrece enlace/archivo para cada uno."""
+    status = await message.reply_text("💧 Leyendo el envío de DripFiles...")
+    try:
+        links, errors, total = await dripfiles_links(url)
+    except dripfiles_mod.DripFilesError as exc:
+        await safe_edit(status, f"❌ DripFiles: {exc}")
+        return
+    except Exception as exc:
+        log.exception("Error leyendo el envío de DripFiles %s", url)
+        await safe_edit(status, f"❌ No pude leer el envío de DripFiles: {exc}")
+        return
+
+    if not links:
+        detail = "\n".join(errors) if errors else "no tiene archivos descargables."
+        await safe_edit(status, f"❌ DripFiles: {detail}")
+        return
+
+    if total == 1:
+        # un solo archivo: el mensaje de estado se convierte en la ficha
+        token = remember(links[0], DRIPFILES_PROVIDER)
+        await safe_edit(
+            status,
+            describe(links[0], DRIPFILES_PROVIDER),
+            reply_markup=action_keyboard(token),
+        )
+        return
+
+    for link in links:
+        token = remember(link, DRIPFILES_PROVIDER)
+        await message.reply_text(
+            describe(link, DRIPFILES_PROVIDER), reply_markup=action_keyboard(token)
+        )
+    for error in errors:
+        await message.reply_text(f"❌ {error}")
+
+    summary = f"💧 Envío de DripFiles: {len(links)}/{min(total, MAX_CONTAINER_LINKS)} archivo(s) listo(s)."
+    if total > MAX_CONTAINER_LINKS:
+        summary += f" (Tiene {total}, procesados los primeros {MAX_CONTAINER_LINKS}.)"
     await safe_edit(status, summary)
 
 
@@ -1237,7 +1423,7 @@ async def on_callback(client: Client, query: CallbackQuery):
                 transfer_to_dripfiles(
                     query.message,
                     link,
-                    session=http if provider_name == DIRECT_PROVIDER else debrid_http,
+                    session=session_for(provider_name),
                     via_ytdlp=is_ytdlp,
                 )
             )
@@ -1273,7 +1459,7 @@ async def on_callback(client: Client, query: CallbackQuery):
                 client,
                 query.message,
                 link,
-                session=http if provider_name == DIRECT_PROVIDER else debrid_http,
+                session=session_for(provider_name),
                 via_ytdlp=is_ytdlp,
             )
         )
@@ -1370,12 +1556,13 @@ async def transfer(
     link: UnrestrictedLink,
     session: aiohttp.ClientSession | None = None,
     via_ytdlp: bool = False,
+    raw: bool = False,
 ):
     progress = await message.reply_text("⬇️ Descargando...")
     path = None
     try:
         path, link = await materialize_download(
-            link, progress, session=session, via_ytdlp=via_ytdlp
+            link, progress, session=session, via_ytdlp=via_ytdlp, raw=raw
         )
         await upload_to_telegram(client, message.chat.id, path, link, progress)
         await progress.delete()
@@ -1390,6 +1577,12 @@ async def transfer(
         )
     except ytdlp_mod.YtDlpError as exc:
         await safe_edit(progress, f"❌ yt-dlp: {exc}")
+    except aiohttp.ClientResponseError as exc:
+        log.info("El servidor respondió %s descargando %s", exc.status, link.filename)
+        await safe_edit(progress, f"❌ El servidor respondió HTTP {exc.status}")
+    except aiohttp.ClientError as exc:
+        log.info("Fallo de red descargando %s: %s", link.filename, exc)
+        await safe_edit(progress, f"❌ Error de red: {exc}")
     except Exception as exc:
         log.exception("Error transfiriendo %s", link.filename)
         await safe_edit(progress, f"❌ Error en la transferencia: {exc}")
@@ -1404,12 +1597,15 @@ async def materialize_download(
     *,
     session: aiohttp.ClientSession | None = None,
     via_ytdlp: bool = False,
+    raw: bool = False,
 ) -> tuple[str, UnrestrictedLink]:
     """Descarga el archivo a disco (debrid/directo o yt-dlp) y ajusta el nombre."""
     if via_ytdlp:
         path = await download_with_ytdlp(link, progress)
     else:
-        path = await download_file(link, progress, session=session or debrid_http)
+        path = await download_file(
+            link, progress, session=session or debrid_http, allow_html=raw
+        )
     final_name = os.path.basename(path)
     if via_ytdlp and final_name and final_name != link.filename:
         display = re.sub(r"^[0-9a-f]{8}_", "", final_name, count=1)
@@ -1594,6 +1790,7 @@ async def download_file(
     link: UnrestrictedLink,
     progress: Message,
     session: aiohttp.ClientSession | None = None,
+    allow_html: bool = False,
 ) -> str:
     session = session or debrid_http
     os.makedirs(cfg.download_dir, exist_ok=True)
@@ -1602,9 +1799,10 @@ async def download_file(
     headers = {"User-Agent": DIRECT_USER_AGENT} if session is http else None
     async with session.get(link.url, headers=headers) as resp:
         resp.raise_for_status()
-        # si el servidor sirve HTML al descargar (anti-hotlink), abortar
+        # si el servidor sirve HTML al descargar (anti-hotlink), abortar;
+        # en modo wget (allow_html) se guarda lo que venga, como haría wget
         ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype in _PAGE_CONTENT_TYPES:
+        if ctype in _PAGE_CONTENT_TYPES and not allow_html:
             raise DirectDownloadError(
                 f"El servidor devolvió HTML en lugar del archivo ({ctype})"
             )
@@ -1738,6 +1936,7 @@ async def main():
     await app.set_bot_commands(
         [
             BotCommand("service", "Elegir el servicio debrid activo"),
+            BotCommand("wget", "Descargar una URL tal cual y subirla aquí"),
             BotCommand("torrents", "Gestionar tus torrents"),
             BotCommand("help", "Ayuda y ejemplos de uso"),
         ]

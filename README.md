@@ -12,6 +12,7 @@
 - 🛠 **Torrent manager** (`/torrents`): browse your torrents, check progress, get links, restart (AllDebrid, Premiumize) or delete them with inline buttons.
 - 📋 **controlc.com pastes**: extracts the links from the paste (prioritizes the hosts in `PASTE_HOST_PRIORITY` in `controlc.py`) and unlocks them all.
 - 🔐 **filecrypt.cc folders**: extracts links via CNL2 (Click'n'Load, same idea as JDownloader). Password: send it after the URL. Captcha folders open **Chrome with uBlock Origin** (+ a small popup guard) so ads don't kick you out of the container.
+- ⬇️ **`/wget URL [name]`**: plain download, wget style — skips debrid, yt-dlp and the "does this look like a file?" heuristics, so it also grabs HTML pages or anything the server returns, then uploads it to Telegram (2 GB limit). Optional second argument renames the file (`wget -O`).
 - 🪞 Mirror rewriting (e.g. `turb.to` → `turbobit.net`) — edit `MIRRORS` in `main.py`.
 - 🔒 Optional user whitelist (`ALLOWED_USER_IDS`).
 - 🧦 Optional proxy for debrid traffic only (`DEBRID_PROXY`): SOCKS5/SOCKS4/HTTP. Useful on VPSes whose datacenter IPs are blocked by AllDebrid & co. — API calls **and** file downloads go through the proxy, Telegram stays direct.
@@ -21,11 +22,13 @@
 - 🎬 Optional **yt-dlp** (`YTDLP=true`): [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube, Vimeo, Instagram and many other sites. **Instagram is tried with yt-dlp first** when enabled; other hosts use it as fallback after debrid/direct. Quality picker (best / 1080p / 720p / audio…) then Link or File. Not installed by default — `pip install yt-dlp` (ffmpeg recommended). By default (`YTDLP_REENCODE_H264=true`) file downloads are re-encoded to **H.264 + AAC** for QuickTime/macOS.
 - 📺 **AllDebrid stream qualities**: when unlock returns multiple stream resolutions (Instagram/YouTube/etc. via AD), the bot shows a quality menu and calls `/link/streaming` (plus delayed-link polling if needed).
 - 💧 **DripFiles** button (`DRIPFILES=true` by default): after unlocking, upload the file to [DripFiles](https://dripfiles.com) via their free public API (no key, ~2 GB, links expire in ~2 days) and get a share URL. Optional description via `DRIPFILES_MESSAGE` (`{filename}`, `{host}`, `{size}` → API field `message`).
+- 💧 **DripFiles downloads**: send a share URL (`https://dripfiles.com/XXXXXXXX`) and the bot reads the share page, lists its files and offers each one with the usual Link / File / DripFiles buttons (up to 20 files per share). Single-file shares are also resolved inside pastes and filecrypt folders.
 
 ## Commands
 
 | Command | Description |
 |---|---|
+| `/wget URL [name]` | Download the URL as-is (no debrid, no checks) and upload it here; optional name works like `wget -O` |
 | `/service` | Choose the active debrid service |
 | `/torrents` | Manage your torrents: progress, links, restart, delete |
 | `/help` | Help |
@@ -77,7 +80,7 @@ config.py          # Configuration via environment variables / .env
 controlc.py        # controlc.com paste link extraction
 filecrypt.py       # filecrypt.cc (CNL2 + Chrome/uBlock for captcha)
 ytdlp.py           # optional yt-dlp fallback (YouTube, Vimeo, …)
-dripfiles.py       # DripFiles free API client (upload + share link)
+dripfiles.py       # DripFiles: free API client (upload) + share page reader (download)
 extensions/
   ublock/          # uBlock Origin (auto-downloaded if missing)
   fc-guard/        # closes ad popups
