@@ -94,6 +94,8 @@ LOCAL_PROVIDERS = (DIRECT_PROVIDER, DRIPFILES_PROVIDER)
 DIRECT_USER_AGENT = (
     "Mozilla/5.0 (compatible; DebridBot/1.0; +https://github.com/Oihalitz/DebridBot)"
 )
+# /wget se identifica como wget de verdad (sin "Mozilla"), no como navegador
+WGET_USER_AGENT = "Wget/1.21.4 (DebridBot/1.0; +https://github.com/Oihalitz/DebridBot)"
 # Content-Types que casi siempre son páginas, no descargas de archivo
 _PAGE_CONTENT_TYPES = frozenset({
     "text/html",
@@ -278,9 +280,11 @@ def is_downloadable_file(
     return False
 
 
-async def _probe_headers(session: aiohttp.ClientSession, url: str) -> tuple[str, dict[str, str], int]:
+async def _probe_headers(
+    session: aiohttp.ClientSession, url: str, *, user_agent: str = DIRECT_USER_AGENT
+) -> tuple[str, dict[str, str], int]:
     """Devuelve (url_final, headers_lower, status). Prefiere HEAD; si falla, GET corto."""
-    headers = {"User-Agent": DIRECT_USER_AGENT, "Accept": "*/*"}
+    headers = {"User-Agent": user_agent, "Accept": "*/*"}
     timeout = aiohttp.ClientTimeout(total=30, connect=15, sock_read=20)
 
     try:
@@ -382,8 +386,9 @@ async def dripfiles_links(url: str) -> tuple[list[UnrestrictedLink], list[str], 
 async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> UnrestrictedLink:
     """Como probe_direct_file pero sin filtros: lo que responda el servidor vale.
 
-    Es el modo `wget`: no se comprueba si parece un archivo (HTML incluido) y si
-    ni siquiera se pueden leer las cabeceras se sigue con el nombre de la URL.
+    Es el modo `wget`: se sondea con el User-Agent de wget (los sitios que miran
+    el UA responden distinto a un navegador), no se comprueba si parece un
+    archivo (HTML incluido) y si no hay cabeceras se sigue con el nombre de la URL.
     """
     url = normalize_github_url(url.strip())
     blind = UnrestrictedLink(
@@ -393,7 +398,9 @@ async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> Unrestrict
         size=None,
     )
     try:
-        final_url, hdrs, status = await _probe_headers(session, url)
+        final_url, hdrs, status = await _probe_headers(
+            session, url, user_agent=WGET_USER_AGENT
+        )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         # sin cabeceras seguimos igual: manda el GET de la descarga, que dirá la verdad
         log.info("wget: no pude sondear %s (%s); descargo a ciegas", url, exc)
@@ -1604,7 +1611,12 @@ async def materialize_download(
         path = await download_with_ytdlp(link, progress)
     else:
         path = await download_file(
-            link, progress, session=session or debrid_http, allow_html=raw
+            link,
+            progress,
+            session=session or debrid_http,
+            allow_html=raw,
+            # el modo wget se anuncia como wget también al descargar, no solo al sondear
+            user_agent=WGET_USER_AGENT if raw else None,
         )
     final_name = os.path.basename(path)
     if via_ytdlp and final_name and final_name != link.filename:
@@ -1791,12 +1803,16 @@ async def download_file(
     progress: Message,
     session: aiohttp.ClientSession | None = None,
     allow_html: bool = False,
+    user_agent: str | None = None,
 ) -> str:
     session = session or debrid_http
     os.makedirs(cfg.download_dir, exist_ok=True)
     path = os.path.join(cfg.download_dir, f"{uuid.uuid4().hex[:8]}_{safe_filename(link.filename)}")
     last_edit = 0.0
-    headers = {"User-Agent": DIRECT_USER_AGENT} if session is http else None
+    # con debrid_http manda la sesión (proxy y cabeceras propias del servicio)
+    headers = (
+        {"User-Agent": user_agent or DIRECT_USER_AGENT} if session is http else None
+    )
     async with session.get(link.url, headers=headers) as resp:
         resp.raise_for_status()
         # si el servidor sirve HTML al descargar (anti-hotlink), abortar;
