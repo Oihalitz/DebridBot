@@ -105,5 +105,5 @@ def load_config() -> Config:
         # Subir a DripFiles (API free, sin key). Por defecto activo.
         dripfiles=(_env("DRIPFILES") or "true").lower() in ("1", "true", "yes", "si", "sí"),
         dripfiles_message=_env("DRIPFILES_MESSAGE")
-        or "{filename}\nHost: {host}\nTamaño: {size}",
+        or "{filename}\nHost: {host}",
     )
