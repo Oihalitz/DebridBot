@@ -79,6 +79,10 @@ GUARD_DIR = EXT_DIR / "fc-guard"
 BROWSER_PROFILE = ROOT / ".browser-profile"
 # Cookies de sesión tras pasar el captcha (PHPSESSID, etc.)
 COOKIE_FILE = ROOT / ".filecrypt-cookies.json"
+_cookie_lock = asyncio.Lock()
+# Chromium + uBlock se reutiliza entre carpetas (varias pestañas a la vez)
+_BROWSER_IDLE_S = 45
+_fc_bg: set[asyncio.Task] = set()
 
 # uBlock Origin Lite (MV3). El uBlock clásico es MV2 y Chrome/Chromium
 # moderno ya no lo carga — por eso no lo veías en la barra.
@@ -176,7 +180,8 @@ async def _fetch(
         # persiste cualquier Set-Cookie nuevo
         jar_cookies = cookies_from_aiohttp_jar(session)
         if jar_cookies:
-            save_cookies(jar_cookies)
+            async with _cookie_lock:
+                save_cookies(jar_cookies)
         return text, str(resp.url)
 
 
@@ -655,27 +660,75 @@ async def _click_pow_captcha(page) -> None:
         await box.click(force=True, timeout=10000)
 
 
-async def _browser_unlock_folder(
-    url: str, password: str | None = None
-) -> tuple[str, str]:
-    """Abre la carpeta en Chrome con uBlock, resuelve captcha PoW y devuelve (html, url)."""
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise CaptchaRequired(
-            "hace falta playwright para el captcha de filecrypt "
-            "(pip install playwright && playwright install chromium)"
-        ) from exc
+def _spawn_fc(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _fc_bg.add(task)
+    task.add_done_callback(_fc_bg.discard)
+    return task
 
-    ext_paths = _extension_paths()
-    BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
-    ext_arg = ",".join(ext_paths)
 
-    async with async_playwright() as p:
+class _FilecryptBrowser:
+    """Un Chromium compartido: cada carpeta abre su pestaña, no un proceso nuevo."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._pw = None
+        self._context = None
+        self._users = 0
+        self._idle_handle: asyncio.TimerHandle | None = None
+
+    def _cancel_idle(self) -> None:
+        if self._idle_handle:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+
+    def _schedule_idle(self) -> None:
+        self._cancel_idle()
+        loop = asyncio.get_running_loop()
+        self._idle_handle = loop.call_later(
+            _BROWSER_IDLE_S, lambda: _spawn_fc(self._idle_close())
+        )
+
+    async def _idle_close(self) -> None:
+        async with self._lock:
+            if self._users > 0:
+                return
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
+        self._cancel_idle()
+        context, pw = self._context, self._pw
+        self._context = None
+        self._pw = None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                log.debug("Cerrar Chromium filecrypt", exc_info=True)
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                log.debug("Stop playwright filecrypt", exc_info=True)
+        log.debug("Chromium filecrypt cerrado (idle)")
+
+    async def _ensure_unlocked(self) -> None:
+        if self._context is not None:
+            return
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            raise CaptchaRequired(
+                "hace falta playwright para el captcha de filecrypt "
+                "(pip install playwright && playwright install chromium)"
+            ) from exc
+
+        ext_paths = _extension_paths()
+        BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+        ext_arg = ",".join(ext_paths)
         # IMPORTANTE: el Google Chrome del sistema (channel=chrome) a partir de
         # ~Chrome 137 IGNORA --load-extension. Hay que usar el Chromium de
         # Playwright (o Chrome for Testing) para que uBlock cargue de verdad.
-        # Además Playwright mete --no-sandbox por defecto → lo ignoramos.
         launch_args = [
             f"--disable-extensions-except={ext_arg}",
             f"--load-extension={ext_arg}",
@@ -686,38 +739,30 @@ async def _browser_unlock_folder(
         ignore_defaults = [
             "--enable-automation",
             "--no-sandbox",
-            "--disable-extensions",  # si no, anula las extensiones
+            "--disable-extensions",
             "--enable-unsafe-swiftshader",
         ]
-        log.debug("Cargando extensiones: %s", ext_paths)
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE),
-            headless=False,  # las extensiones no cargan en headless clásico
-            args=launch_args,
-            ignore_default_args=ignore_defaults,
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-            user_agent=USER_AGENT,
-            timezone_id="Europe/Madrid",
-        )
+        log.info("Arrancando Chromium filecrypt (uBlock)…")
+        self._pw = await async_playwright().start()
+        try:
+            self._context = await self._pw.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_PROFILE),
+                headless=False,
+                args=launch_args,
+                ignore_default_args=ignore_defaults,
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                user_agent=USER_AGENT,
+                timezone_id="Europe/Madrid",
+            )
+        except Exception:
+            await self._stop_unlocked()
+            raise
 
-        await context.add_init_script(
+        await self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
-        # Espera a que arranquen los service workers de las extensiones MV3
-        await asyncio.sleep(2.5)
-        loaded = await _verify_extensions_loaded(context)
-        if not loaded:
-            log.warning(
-                "No se detectó ninguna extensión cargada. "
-                "¿Ejecutaste 'playwright install chromium'? "
-                "Sigo con bloqueo de ads por código, pero sin icono de uBlock."
-            )
-        else:
-            log.debug("Extensiones activas: %d", len(loaded))
-
-        # Cierra pestañas de anuncios que se cuelen pese a uBlock
         async def on_page(page):
             def _maybe_close(p=page):
                 async def runner():
@@ -729,182 +774,209 @@ async def _browser_unlock_folder(
                     except Exception:
                         pass
 
-                asyncio.create_task(runner())
+                _spawn_fc(runner())
 
             page.on("framenavigated", lambda _f: _maybe_close())
 
-        context.on("page", on_page)
-
-        page = context.pages[0] if context.pages else await context.new_page()
-
-        # uBlock + bloqueo extra: ads y redirects fuera de filecrypt
-        async def route_handler(route):
-            req = route.request
-            u = req.url.lower()
-            if any(m in u for m in AD_HOST_MARKERS) and not _is_filecrypt_related(req.url):
-                await route.abort()
-                return
-            if req.resource_type == "document" and req.frame == page.main_frame:
-                if req.url.startswith("http") and not _is_filecrypt_related(req.url):
-                    log.debug("Bloqueado redirect a %s", req.url[:120])
-                    await route.abort()
-                    return
-            await route.continue_()
-
-        await page.route("**/*", route_handler)
-
-        # Da tiempo a que uBlock cargue filtros en el perfil persistente
-        await page.wait_for_timeout(2000)
-
-        log.info("Abriendo %s con uBlock...", url)
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(1500)
-
-        # Password si el formulario está visible
-        if password:
-            for name in PASSWORD_FIELD_NAMES:
-                loc = page.locator(f'input[name="{name}"]')
-                if await loc.count():
-                    await loc.fill(password)
-                    break
-
-        await _strip_ad_overlays(page)
-
-        # Click captcha PoW si existe
-        pow_box = page.locator(".pow-captcha__box, #pow-captcha .pow-captcha__box")
-        if await pow_box.count():
-            log.info("Captcha PoW detectado — haciendo click (uBlock activo)")
-            try:
-                await _click_pow_captcha(page)
-            except Exception:
-                log.exception("No se pudo clickar el captcha")
-        # Espera a que desaparezca el captcha / aparezcan enlaces
-        deadline = time.monotonic() + CAPTCHA_TIMEOUT_S
-        final_html = None
-        while time.monotonic() < deadline:
-            # mata pestañas extra de anuncios
-            for p in list(context.pages):
-                try:
-                    if p is page:
-                        continue
-                    u = p.url
-                    if u and not _is_filecrypt_related(u):
-                        await p.close()
-                except Exception:
-                    pass
-
-            try:
-                # si nos echaron, volver
-                if page.url.startswith("http") and not _is_filecrypt_related(page.url):
-                    log.warning("Salimos de filecrypt → volviendo")
-                    await page.goto(url, wait_until="domcontentloaded")
-                    if await pow_box.count():
-                        await pow_box.first.click(force=True)
-
-                content = await page.content()
-                state = await page.evaluate(
-                    """() => {
-                        const el = document.getElementById('pow-captcha');
-                        return el ? el.getAttribute('data-state') : null;
-                    }"""
-                )
-
-                # rellena password en el form si sigue visible tras captcha
-                if password and state == "done":
-                    for name in PASSWORD_FIELD_NAMES:
-                        loc = page.locator(f'input[name="{name}"]')
-                        if await loc.count():
-                            await loc.fill(password)
-
-                if _page_looks_unlocked(content) or (
-                    state is None
-                    and "pow-captcha" not in content
-                    and "Security Check" not in content
-                    and "Sicherheits" not in content
-                ):
-                    # espera un pelín a CNL/render
-                    await page.wait_for_timeout(1500)
-                    final_html = await page.content()
-                    if _has_captcha(final_html) and not (
-                        'name="crypted"' in final_html or OPEN_LINK_RE.search(final_html)
-                    ):
-                        final_html = None
-                    else:
-                        break
-
-                if state == "fail":
-                    log.warning("Captcha falló, reintentando click")
-                    await page.reload(wait_until="domcontentloaded")
-                    await page.wait_for_timeout(1000)
-                    await _strip_ad_overlays(page)
-                    if await page.locator(".pow-captcha__box").count():
-                        await _click_pow_captcha(page)
-
-            except Exception as exc:
-                log.debug("poll: %s", exc)
-
-            await page.wait_for_timeout(POPUP_KILL_INTERVAL_MS)
-
-        final_url = page.url
-        if not final_html:
-            try:
-                final_html = await page.content()
-            except Exception:
-                final_html = ""
-
-        # Asegura CNL en el HTML (a veces va en forms dinámicos)
-        try:
-            cnl_bits = await page.evaluate(
-                """() => {
-                const out = {crypted: '', jk: '', htmlExtra: ''};
-                const c = document.querySelector('input[name=crypted], textarea[name=crypted]');
-                const j = document.querySelector('input[name=jk], textarea[name=jk]');
-                if (c) out.crypted = c.value || '';
-                if (j) out.jk = j.value || '';
-                // formularios CNLPOP / cnlform
-                for (const f of document.forms) {
-                    const t = f.outerHTML || '';
-                    if (/cnl|crypted|jk/i.test(t)) out.htmlExtra += t + '\\n';
-                }
-                return out;
-            }"""
+        self._context.on("page", on_page)
+        await asyncio.sleep(2.5)
+        loaded = await _verify_extensions_loaded(self._context)
+        if not loaded:
+            log.warning(
+                "No se detectó ninguna extensión cargada. "
+                "¿Ejecutaste 'playwright install chromium'? "
+                "Sigo con bloqueo de ads por código, pero sin icono de uBlock."
             )
-            if cnl_bits:
-                if cnl_bits.get("crypted") and cnl_bits.get("jk"):
-                    # embebe inputs por si el content() no los trajo bien
-                    final_html += (
-                        f'\n<input name="crypted" value="{cnl_bits["crypted"]}"/>'
-                        f'\n<input name="jk" value="{cnl_bits["jk"]}"/>\n'
-                    )
-                if cnl_bits.get("htmlExtra"):
-                    final_html += "\n" + cnl_bits["htmlExtra"]
-        except Exception:
-            log.debug("No se pudo leer CNL del DOM", exc_info=True)
 
-        # Guardar cookies de la sesión desbloqueada (lo importante)
+    async def open_page(self):
+        async with self._lock:
+            self._cancel_idle()
+            await self._ensure_unlocked()
+            self._users += 1
+            try:
+                return await self._context.new_page()
+            except Exception:
+                self._users = max(0, self._users - 1)
+                if self._users == 0:
+                    self._schedule_idle()
+                raise
+
+    async def close_page(self, page) -> None:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        async with self._lock:
+            self._users = max(0, self._users - 1)
+            if self._users == 0:
+                self._schedule_idle()
+
+    async def save_cookies(self) -> None:
+        context = self._context
+        if context is None:
+            return
         try:
             browser_cookies = await context.cookies()
-            fc_cookies = [
-                c
-                for c in browser_cookies
-                if "filecrypt" in (c.get("domain") or "")
-                or c.get("name")
-                in ("PHPSESSID", "lang", "lang_v2", "BetterJsPopCount")
-            ]
-            if fc_cookies:
-                save_cookies(fc_cookies)
-            else:
-                save_cookies(browser_cookies)
-            log.debug(
-                "Cookies del navegador guardadas (%d filecrypt / %d total) → %s",
-                len(fc_cookies),
-                len(browser_cookies),
-                COOKIE_FILE,
-            )
         except Exception:
-            log.exception("No se pudieron guardar cookies del navegador")
+            log.exception("No se pudieron leer cookies del navegador")
+            return
+        fc_cookies = [
+            c
+            for c in browser_cookies
+            if "filecrypt" in (c.get("domain") or "")
+            or c.get("name") in ("PHPSESSID", "lang", "lang_v2", "BetterJsPopCount")
+        ]
+        to_save = fc_cookies or browser_cookies
+        if not to_save:
+            return
+        async with _cookie_lock:
+            save_cookies(to_save)
+        log.debug(
+            "Cookies del navegador guardadas (%d filecrypt / %d total)",
+            len(fc_cookies),
+            len(browser_cookies),
+        )
 
-        await context.close()
+
+_fc_browser = _FilecryptBrowser()
+
+
+async def _unlock_on_page(page, url: str, password: str | None) -> tuple[str, str]:
+    """Resuelve captcha / password en una pestaña ya abierta."""
+
+    async def route_handler(route):
+        req = route.request
+        u = req.url.lower()
+        if any(m in u for m in AD_HOST_MARKERS) and not _is_filecrypt_related(req.url):
+            await route.abort()
+            return
+        if req.resource_type == "document" and req.frame == page.main_frame:
+            if req.url.startswith("http") and not _is_filecrypt_related(req.url):
+                log.debug("Bloqueado redirect a %s", req.url[:120])
+                await route.abort()
+                return
+        await route.continue_()
+
+    await page.route("**/*", route_handler)
+    log.info("Abriendo %s con uBlock...", url)
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(1500)
+
+    if password:
+        for name in PASSWORD_FIELD_NAMES:
+            loc = page.locator(f'input[name="{name}"]')
+            if await loc.count():
+                await loc.fill(password)
+                break
+
+    await _strip_ad_overlays(page)
+
+    pow_box = page.locator(".pow-captcha__box, #pow-captcha .pow-captcha__box")
+    if await pow_box.count():
+        log.info("Captcha PoW detectado — haciendo click (uBlock activo)")
+        try:
+            await _click_pow_captcha(page)
+        except Exception:
+            log.exception("No se pudo clickar el captcha")
+
+    deadline = time.monotonic() + CAPTCHA_TIMEOUT_S
+    final_html = None
+    while time.monotonic() < deadline:
+        try:
+            if page.url.startswith("http") and not _is_filecrypt_related(page.url):
+                log.warning("Salimos de filecrypt → volviendo")
+                await page.goto(url, wait_until="domcontentloaded")
+                if await pow_box.count():
+                    await pow_box.first.click(force=True)
+
+            content = await page.content()
+            state = await page.evaluate(
+                """() => {
+                    const el = document.getElementById('pow-captcha');
+                    return el ? el.getAttribute('data-state') : null;
+                }"""
+            )
+
+            if password and state == "done":
+                for name in PASSWORD_FIELD_NAMES:
+                    loc = page.locator(f'input[name="{name}"]')
+                    if await loc.count():
+                        await loc.fill(password)
+
+            if _page_looks_unlocked(content) or (
+                state is None
+                and "pow-captcha" not in content
+                and "Security Check" not in content
+                and "Sicherheits" not in content
+            ):
+                await page.wait_for_timeout(1500)
+                final_html = await page.content()
+                if _has_captcha(final_html) and not (
+                    'name="crypted"' in final_html or OPEN_LINK_RE.search(final_html)
+                ):
+                    final_html = None
+                else:
+                    break
+
+            if state == "fail":
+                log.warning("Captcha falló, reintentando click")
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(1000)
+                await _strip_ad_overlays(page)
+                if await page.locator(".pow-captcha__box").count():
+                    await _click_pow_captcha(page)
+
+        except Exception as exc:
+            log.debug("poll: %s", exc)
+
+        await page.wait_for_timeout(POPUP_KILL_INTERVAL_MS)
+
+    final_url = page.url
+    if not final_html:
+        try:
+            final_html = await page.content()
+        except Exception:
+            final_html = ""
+
+    try:
+        cnl_bits = await page.evaluate(
+            """() => {
+            const out = {crypted: '', jk: '', htmlExtra: ''};
+            const c = document.querySelector('input[name=crypted], textarea[name=crypted]');
+            const j = document.querySelector('input[name=jk], textarea[name=jk]');
+            if (c) out.crypted = c.value || '';
+            if (j) out.jk = j.value || '';
+            for (const f of document.forms) {
+                const t = f.outerHTML || '';
+                if (/cnl|crypted|jk/i.test(t)) out.htmlExtra += t + '\\n';
+            }
+            return out;
+        }"""
+        )
+        if cnl_bits:
+            if cnl_bits.get("crypted") and cnl_bits.get("jk"):
+                final_html += (
+                    f'\n<input name="crypted" value="{cnl_bits["crypted"]}"/>'
+                    f'\n<input name="jk" value="{cnl_bits["jk"]}"/>\n'
+                )
+            if cnl_bits.get("htmlExtra"):
+                final_html += "\n" + cnl_bits["htmlExtra"]
+    except Exception:
+        log.debug("No se pudo leer CNL del DOM", exc_info=True)
+
+    return final_html, final_url
+
+
+async def _browser_unlock_folder(
+    url: str, password: str | None = None
+) -> tuple[str, str]:
+    """Abre la carpeta en una pestaña del Chromium compartido (uBlock + captcha PoW)."""
+    page = await _fc_browser.open_page()
+    try:
+        final_html, final_url = await _unlock_on_page(page, url, password)
+        await _fc_browser.save_cookies()
+    finally:
+        await _fc_browser.close_page(page)
 
     if not final_html or (
         not _page_looks_unlocked(final_html)

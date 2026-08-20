@@ -786,6 +786,7 @@ def build_help_text() -> str:
         [
             "• Un **paste de controlc.com** → extraigo sus enlaces y los desbloqueo todos.",
             "• Una **carpeta de filecrypt.cc** → extraigo los enlaces y los desbloqueo. "
+            "Puedes mandar varias a la vez (mensajes o varias URLs). "
             "Si pide contraseña, mándala después del enlace. Con captcha se abre Chrome + uBlock.",
             "• Un **magnet** o un archivo **.torrent** → lo añado a tu debrid; si tiene "
             "varios archivos eliges cuáles (y al terminar, cuál enlace o subir).\n",
@@ -952,7 +953,7 @@ def picker_text(picker: TorrentPicker, provider_name: str) -> str:
             f"📂 {len(picker.files)} archivo(s){extra}{size_s} · {provider_name}\n"
             f"☑️ {len(picker.selected)} seleccionados{sel_s}\n\n"
             "Marca lo que quieres y pulsa **Descargar**.\n"
-            "_Por defecto: vídeos (sin samples)._"
+            "__Por defecto: vídeos (sin samples).__"
         )
     return (
         f"✅ **{picker.name}**\n"
@@ -1192,10 +1193,25 @@ async def handle_text(_, message: Message):
         if not providers:
             await message.reply_text("❌ No hay servicios debrid configurados.")
             return
-        # segunda palabra opcional = contraseña de la carpeta
-        password = parts[1] if len(parts) > 1 else None
+        urls, password = parse_filecrypt_jobs(message.text)
+        if not urls:
+            urls = [text]
+            password = parts[1] if len(parts) > 1 else None
+        if len(urls) > MAX_FILECRYPT_FOLDERS:
+            extra = len(urls) - MAX_FILECRYPT_FOLDERS
+            urls = urls[:MAX_FILECRYPT_FOLDERS]
+            await message.reply_text(
+                f"🔐 Cojo las primeras {MAX_FILECRYPT_FOLDERS} carpetas "
+                f"(dejo {extra} para otro mensaje)."
+            )
         provider = provider_for(message.from_user.id)
-        await handle_filecrypt(provider, message, text, password)
+        total = len(urls)
+        for i, url in enumerate(urls, 1):
+            spawn(
+                handle_filecrypt(
+                    provider, message, url, password, index=i, total=total
+                )
+            )
         return
 
     url = normalize_mirrors(text)
@@ -1283,6 +1299,22 @@ async def handle_text(_, message: Message):
 
 
 MAX_CONTAINER_LINKS = 20
+MAX_FILECRYPT_FOLDERS = 10
+
+
+def parse_filecrypt_jobs(text: str) -> tuple[list[str], str | None]:
+    """URLs de filecrypt en el mensaje + contraseña (cualquier token que no sea URL)."""
+    urls: list[str] = []
+    password_parts: list[str] = []
+    for token in text.split():
+        if is_url(token) and is_filecrypt(token):
+            urls.append(token)
+        elif is_url(token):
+            continue
+        else:
+            password_parts.append(token)
+    password = " ".join(password_parts) if password_parts else None
+    return urls, password
 
 
 async def unlock_many(
@@ -1373,12 +1405,19 @@ async def handle_paste(provider: DebridProvider, message: Message, url: str):
 
 
 async def handle_filecrypt(
-    provider: DebridProvider, message: Message, url: str, password: str | None
+    provider: DebridProvider,
+    message: Message,
+    url: str,
+    password: str | None,
+    *,
+    index: int = 1,
+    total: int = 1,
 ):
+    prefix = f"({index}/{total}) " if total > 1 else ""
     status = await message.reply_text(
-        "🔐 Abriendo carpeta de filecrypt...\n"
-        "_(Si hay captcha se abre Chromium + uBlock; al pasarlo se guardan cookies "
-        "para no repetirlo. Puede tardar un minuto.)_"
+        f"🔐 {prefix}Abriendo carpeta de filecrypt...\n"
+        "__(Si hay captcha se abre Chromium + uBlock; al pasarlo se guardan cookies "
+        "para no repetirlo. Puede tardar un minuto.)__"
     )
     try:
         folder_links = await get_folder_links(http, url, password)
@@ -1835,8 +1874,8 @@ async def on_callback(client: Client, query: CallbackQuery):
                     query.message,
                     describe(link, provider_name)
                     + f"\n\n🔗 [Descargar]({direct})\n\n"
-                    "_URL temporal de la plataforma; puede caducar. "
-                    "Para HLS/DASH usa 📤 Archivo o 💧 DripFiles._",
+                    "__URL temporal de la plataforma; puede caducar. "
+                    "Para HLS/DASH usa 📤 Archivo o 💧 DripFiles.__",
                 )
                 return
             await safe_edit(
