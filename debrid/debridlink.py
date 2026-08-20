@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiohttp
 
-from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
+from .base import DebridError, DebridProvider, TorrentFile, TorrentInfo, UnrestrictedLink
 
 BASE = "https://debrid-link.com/api/v2"
 
@@ -69,17 +69,19 @@ class DebridLink(DebridProvider):
     async def torrent_info(self, torrent_id: str) -> TorrentInfo:
         return self._to_info(await self._find_torrent(torrent_id))
 
+    async def torrent_files(self, torrent_id: str) -> list[TorrentFile]:
+        return _files_from_debridlink(await self._find_torrent(torrent_id))
+
     async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
-        torrent = await self._find_torrent(torrent_id)
         return [
             UnrestrictedLink(
-                url=file["downloadUrl"],
-                filename=file.get("name") or "archivo",
+                url=file.url,
+                filename=file.name,
                 host=self.slug,
-                size=file.get("size") or None,
+                size=file.size,
             )
-            for file in torrent.get("files") or []
-            if file.get("downloadUrl") and float(file.get("downloadPercent") or 0) >= 100
+            for file in await self.torrent_files(torrent_id)
+            if file.url
         ]
 
     async def list_torrents(self) -> list[TorrentInfo]:
@@ -102,4 +104,23 @@ class DebridLink(DebridProvider):
             status=status,
             progress=100.0 if status == "ready" else progress,
             detail=detail,
+            files=_files_from_debridlink(torrent),
         )
+
+
+def _files_from_debridlink(torrent: dict) -> list[TorrentFile]:
+    files: list[TorrentFile] = []
+    for entry in torrent.get("files") or []:
+        ready = float(entry.get("downloadPercent") or 0) >= 100
+        name = entry.get("name") or "archivo"
+        files.append(
+            TorrentFile(
+                id=str(entry.get("id") or name),
+                name=name.rsplit("/", 1)[-1],
+                path=name,
+                size=entry.get("size") or None,
+                url=entry.get("downloadUrl") if ready else None,
+                selected=True,
+            )
+        )
+    return files

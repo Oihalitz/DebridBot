@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
-from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
+from .base import DebridError, DebridProvider, TorrentFile, TorrentInfo, UnrestrictedLink
 
 BASE = "https://api.alldebrid.com/v4"
 BASE_41 = "https://api.alldebrid.com/v4.1"
@@ -308,22 +308,34 @@ class AllDebrid(DebridProvider):
             magnet = magnet[0]
         return self._to_info(magnet)
 
-    async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
+    async def torrent_files(self, torrent_id: str) -> list[TorrentFile]:
         data = await self._request("GET", "/magnet/files", params={"id[]": torrent_id})
         magnets = data.get("magnets") or []
         if not magnets:
             return []
-        flat: list[dict] = []
+        return _flatten_magnet_files(magnets[0].get("files") or [])
 
-        def walk(entries: list[dict]):
-            for entry in entries:
-                if entry.get("e"):
-                    walk(entry["e"])
-                elif entry.get("l"):
-                    flat.append(entry)
+    async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
+        files = await self.torrent_files(torrent_id)
+        links: list[UnrestrictedLink] = []
+        for item in files:
+            if not item.url:
+                continue
+            links.append(await self.unrestrict(item.url, auto_pick_stream=True))
+        return links
 
-        walk(magnets[0].get("files") or [])
-        return [await self.unrestrict(entry["l"], auto_pick_stream=True) for entry in flat]
+    async def torrent_file_link(self, torrent_id: str, file: TorrentFile) -> UnrestrictedLink:
+        url = file.url
+        if not url:
+            files = await self.torrent_files(torrent_id)
+            match = next(
+                (item for item in files if item.id == file.id or item.path == file.path),
+                None,
+            )
+            url = match.url if match else None
+        if not url:
+            raise DebridError(f"{self.name}: ese archivo aún no tiene enlace")
+        return await self.unrestrict(url, auto_pick_stream=True)
 
     async def list_torrents(self) -> list[TorrentInfo]:
         data = await self._request("POST", f"{BASE_41}/magnet/status")
@@ -358,3 +370,26 @@ class AllDebrid(DebridProvider):
             progress=progress,
             detail=magnet.get("status", ""),
         )
+
+
+def _flatten_magnet_files(entries: list[dict], prefix: str = "") -> list[TorrentFile]:
+    files: list[TorrentFile] = []
+    for entry in entries:
+        name = entry.get("n") or "archivo"
+        path = f"{prefix}/{name}" if prefix else name
+        children = entry.get("e")
+        if children:
+            files.extend(_flatten_magnet_files(children, path))
+            continue
+        size = entry.get("s")
+        files.append(
+            TorrentFile(
+                id=path,
+                name=name,
+                path=path,
+                size=int(size) if size is not None else None,
+                url=entry.get("l"),
+                selected=True,
+            )
+        )
+    return files

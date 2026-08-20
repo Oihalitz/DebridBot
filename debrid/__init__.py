@@ -8,7 +8,7 @@ from .alldebrid import (
     AllDebrid,
     NeedsStreamChoice,
 )
-from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
+from .base import DebridError, DebridProvider, TorrentFile, TorrentInfo, UnrestrictedLink
 from .debridlink import DebridLink
 from .deepbrid import Deepbrid
 from .highway import Highway
@@ -31,6 +31,7 @@ __all__ = [
     "Premiumize",
     "RealDebrid",
     "TorBox",
+    "TorrentFile",
     "TorrentInfo",
     "UnrestrictedLink",
     "build_providers",

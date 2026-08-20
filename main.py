@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -26,6 +27,7 @@ from debrid import (
     DebridError,
     DebridProvider,
     NeedsStreamChoice,
+    TorrentFile,
     UnrestrictedLink,
     build_providers,
 )
@@ -71,6 +73,8 @@ pending: dict[str, tuple[UnrestrictedLink, str]] = {}
 pending_ytdlp: dict[str, ytdlp_mod.MediaProbe] = {}
 # token -> AdStreamProbe (menú de calidades AllDebrid streaming)
 pending_ad_streams: dict[str, AdStreamProbe] = {}
+# token -> TorrentPicker (elección de archivos de un torrent)
+pending_pickers: dict[str, "TorrentPicker"] = {}
 
 # Sitios donde yt-dlp va primero (si YTDLP=true), antes que debrid
 _YTDLP_FIRST_HOST_SUFFIXES = (
@@ -85,7 +89,27 @@ background_tasks: set[asyncio.Task] = set()
 
 MAX_TG_SIZE = 2 * 1024**3  # límite de subida para bots (2 GB)
 MAX_TORRENT_FILES = 25
-STATUS_EMOJI = {"queued": "🕓", "downloading": "⬇️", "ready": "✅", "error": "❌"}
+MAX_PICKER_FILES = 200
+PICKER_PAGE_SIZE = 8
+STATUS_EMOJI = {
+    "queued": "🕓",
+    "downloading": "⬇️",
+    "ready": "✅",
+    "error": "❌",
+    "select": "📂",
+}
+_VIDEO_EXTS = {
+    ".mkv", ".mp4", ".avi", ".webm", ".mov", ".wmv", ".m4v",
+    ".ts", ".m2ts", ".mpg", ".mpeg", ".flv", ".vob", ".iso", ".m2v",
+}
+_JUNK_EXTS = {
+    ".nfo", ".txt", ".jpg", ".jpeg", ".png", ".gif", ".sfv",
+    ".url", ".html", ".md5", ".crc", ".srr",
+}
+_SKIP_VIDEO_RE = re.compile(
+    r"(?:^|[\\/._\s-])(?:sample|proof|trailer)(?:[\\/._\s-]|$)",
+    re.I,
+)
 DIRECT_PROVIDER = "Directo"
 DRIPFILES_PROVIDER = "DripFiles"
 YTDLP_PROVIDER = ytdlp_mod.PROVIDER_NAME
@@ -763,8 +787,8 @@ def build_help_text() -> str:
             "• Un **paste de controlc.com** → extraigo sus enlaces y los desbloqueo todos.",
             "• Una **carpeta de filecrypt.cc** → extraigo los enlaces y los desbloqueo. "
             "Si pide contraseña, mándala después del enlace. Con captcha se abre Chrome + uBlock.",
-            "• Un **magnet** o un archivo **.torrent** → lo descargo en tu servicio debrid "
-            "y cuando termine te doy los archivos.\n",
+            "• Un **magnet** o un archivo **.torrent** → lo añado a tu debrid; si tiene "
+            "varios archivos eliges cuáles (y al terminar, cuál enlace o subir).\n",
             "**Comandos:**",
             "/wget `URL [nombre]` — descarga la URL **tal cual** (sin debrid ni "
             "comprobaciones) y te la subo aquí; el nombre es opcional, como `wget -O`",
@@ -845,12 +869,161 @@ TORRENTS_PAGE_SIZE = 8
 # clave -> (etiqueta del botón, estados que incluye; None = todos)
 TORRENT_FILTERS = {
     "all": ("Todos", None),
-    "active": ("⏬", ("queued", "downloading")),
+    "active": ("⏬", ("queued", "downloading", "select")),
     "ready": ("✅", ("ready",)),
     "error": ("❌", ("error",)),
 }
 # última página/filtro que veía cada chat, para que "Volver" no te mande a la primera
 torrents_view_state: dict[int, tuple[int, str]] = {}
+
+
+@dataclass
+class TorrentPicker:
+    slug: str
+    torrent_id: str
+    name: str
+    files: list[TorrentFile]
+    mode: str  # "select" (antes de descargar) | "ready" (ya completado)
+    selected: set[int] = field(default_factory=set)
+    page: int = 0
+    links: dict[str, UnrestrictedLink] = field(default_factory=dict)
+
+
+def remember_picker(picker: TorrentPicker) -> str:
+    if len(pending_pickers) > 200:
+        for key in list(pending_pickers)[:50]:
+            pending_pickers.pop(key, None)
+    token = uuid.uuid4().hex[:12]
+    pending_pickers[token] = picker
+    return token
+
+
+def _is_main_video(file: TorrentFile) -> bool:
+    ext = os.path.splitext(file.name)[1].lower()
+    if ext not in _VIDEO_EXTS:
+        return False
+    return not _SKIP_VIDEO_RE.search(file.path or file.name)
+
+
+def default_selected(files: list[TorrentFile]) -> set[int]:
+    videos = {i for i, f in enumerate(files) if _is_main_video(f)}
+    if videos:
+        return videos
+    useful = {
+        i
+        for i, f in enumerate(files)
+        if os.path.splitext(f.name)[1].lower() not in _JUNK_EXTS
+    }
+    return useful if useful else set(range(len(files)))
+
+
+def _file_button_label(
+    file: TorrentFile, files: list[TorrentFile], checked: bool | None
+) -> str:
+    if checked is True:
+        mark = "☑️ "
+    elif checked is False:
+        mark = "☐ "
+    else:
+        mark = "📄 "
+    names = [item.name for item in files]
+    name = file.path if names.count(file.name) > 1 and file.path else file.name
+    size = f" · {human_size(file.size)}" if file.size else ""
+    budget = 64 - len(mark) - len(size)
+    if budget < 4:
+        return (mark + name)[:63] + "…"
+    if len(name) > budget:
+        name = name[: budget - 1] + "…"
+    return f"{mark}{name}{size}"
+
+
+def picker_text(picker: TorrentPicker, provider_name: str) -> str:
+    total_size = sum(f.size or 0 for f in picker.files)
+    size_s = f" · {human_size(total_size)}" if total_size else ""
+    extra = ""
+    if len(picker.files) >= MAX_PICKER_FILES:
+        extra = f" (primeros {MAX_PICKER_FILES})"
+    if picker.mode == "select":
+        sel = [picker.files[i] for i in picker.selected if i < len(picker.files)]
+        sel_size = sum(f.size or 0 for f in sel)
+        sel_s = f" · {human_size(sel_size)}" if sel_size else ""
+        return (
+            f"🧲 **{picker.name}**\n"
+            f"📂 {len(picker.files)} archivo(s){extra}{size_s} · {provider_name}\n"
+            f"☑️ {len(picker.selected)} seleccionados{sel_s}\n\n"
+            "Marca lo que quieres y pulsa **Descargar**.\n"
+            "_Por defecto: vídeos (sin samples)._"
+        )
+    return (
+        f"✅ **{picker.name}**\n"
+        f"📂 {len(picker.files)} archivo(s){extra}{size_s} · {provider_name}\n\n"
+        "Toca un archivo para **enlace** o **subirlo** aquí."
+    )
+
+
+def picker_keyboard(token: str, picker: TorrentPicker) -> InlineKeyboardMarkup:
+    pages = max(1, -(-len(picker.files) // PICKER_PAGE_SIZE))
+    picker.page = max(0, min(picker.page, pages - 1))
+    start = picker.page * PICKER_PAGE_SIZE
+    chunk = picker.files[start : start + PICKER_PAGE_SIZE]
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, torrent_file in enumerate(chunk, start=start):
+        if picker.mode == "select":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        _file_button_label(
+                            torrent_file, picker.files, i in picker.selected
+                        ),
+                        callback_data=f"tf:{token}:t:{i}",
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        _file_button_label(torrent_file, picker.files, None),
+                        callback_data=f"tf:{token}:f:{i}",
+                    )
+                ]
+            )
+    if picker.mode == "select":
+        rows.append(
+            [
+                InlineKeyboardButton("Todos", callback_data=f"tf:{token}:all"),
+                InlineKeyboardButton("Vídeos", callback_data=f"tf:{token}:vid"),
+                InlineKeyboardButton("Ninguno", callback_data=f"tf:{token}:none"),
+            ]
+        )
+        n = len(picker.selected)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"⬇️ Descargar ({n})" if n else "⬇️ Elige algún archivo",
+                    callback_data=f"tf:{token}:go",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [InlineKeyboardButton("📦 Mandar todos", callback_data=f"tf:{token}:dump")]
+        )
+    if pages > 1:
+        nav = []
+        if picker.page > 0:
+            nav.append(
+                InlineKeyboardButton("⬅️", callback_data=f"tf:{token}:p:{picker.page - 1}")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{picker.page + 1}/{pages}", callback_data="noop:-")
+        )
+        if picker.page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("➡️", callback_data=f"tf:{token}:p:{picker.page + 1}")
+            )
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
 
 
 async def torrents_list_view(
@@ -916,11 +1089,25 @@ async def torrent_detail_view(
         f"`[{progress_bar(info.progress)}]` {info.progress:.1f}%\n"
         f"Estado: {info.detail or info.status} · {provider.name}"
     )
+    if info.files:
+        text += f"\n📂 {len(info.files)} archivo(s)"
     slug = provider.slug
     rows = []
-    if info.status == "ready":
+    if info.needs_file_selection or info.status == "select":
         rows.append(
-            [InlineKeyboardButton("📂 Obtener enlaces", callback_data=f"torlinks:{slug}:{torrent_id}")]
+            [
+                InlineKeyboardButton(
+                    "📂 Elegir archivos", callback_data=f"torfiles:{slug}:{torrent_id}"
+                )
+            ]
+        )
+    elif info.status == "ready":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📂 Archivos", callback_data=f"torfiles:{slug}:{torrent_id}"
+                )
+            ]
         )
     action_row = [InlineKeyboardButton("🔄 Actualizar", callback_data=f"tor:{slug}:{torrent_id}")]
     if provider.supports_restart and info.status == "error":
@@ -1245,7 +1432,13 @@ async def start_torrent(
     spawn(monitor_torrent(provider, status, torrent_id))
 
 
-async def monitor_torrent(provider: DebridProvider, status: Message, torrent_id: str):
+async def monitor_torrent(
+    provider: DebridProvider,
+    status: Message,
+    torrent_id: str,
+    *,
+    skip_select: bool = False,
+):
     last_text = ""
     deadline = time.monotonic() + 3 * 3600
     while time.monotonic() < deadline:
@@ -1263,26 +1456,44 @@ async def monitor_torrent(provider: DebridProvider, status: Message, torrent_id:
             await safe_edit(status, f"❌ Torrent en error: {info.detail or 'desconocido'}")
             return
 
+        if info.needs_file_selection or info.status == "select":
+            files = list(info.files or [])
+            already_chosen = skip_select or any(item.selected for item in files)
+            if already_chosen:
+                text = (
+                    f"🧲 **{info.name}**\n"
+                    f"⬇️ Archivos seleccionados, esperando a {provider.name}…"
+                )
+                if text != last_text:
+                    await safe_edit(status, text)
+                    last_text = text
+                await asyncio.sleep(3)
+                continue
+            if not files:
+                text = (
+                    f"🧲 **{info.name}**\n"
+                    "⏳ Convirtiendo magnet, esperando la lista de archivos…\n"
+                    f"{provider.name}"
+                )
+                if text != last_text:
+                    await safe_edit(status, text)
+                    last_text = text
+                await asyncio.sleep(5)
+                continue
+            if len(files) == 1:
+                try:
+                    await provider.select_torrent_files(torrent_id, [files[0].id])
+                except DebridError as exc:
+                    await safe_edit(status, f"❌ {exc}")
+                    return
+                skip_select = True
+                await asyncio.sleep(2)
+                continue
+            await show_select_picker(provider, status, torrent_id, info.name, files)
+            return
+
         if info.status == "ready":
-            await safe_edit(status, f"✅ **{info.name}**\nCompletado, generando enlaces...")
-            try:
-                links = await provider.torrent_links(torrent_id)
-            except DebridError as exc:
-                await safe_edit(status, f"❌ {exc}")
-                return
-            if not links:
-                await safe_edit(status, "❌ El torrent no generó ningún enlace.")
-                return
-            await safe_edit(status, f"✅ **{info.name}** — {len(links)} archivo(s)")
-            for link in links[:MAX_TORRENT_FILES]:
-                token = remember(link, provider)
-                await status.reply_text(
-                    describe(link, provider.name), reply_markup=action_keyboard(token)
-                )
-            if len(links) > MAX_TORRENT_FILES:
-                await status.reply_text(
-                    f"… y {len(links) - MAX_TORRENT_FILES} archivo(s) más en la web de {provider.name}."
-                )
+            await offer_ready_files(provider, status, torrent_id, info)
             return
 
         text = (
@@ -1296,6 +1507,191 @@ async def monitor_torrent(provider: DebridProvider, status: Message, torrent_id:
         await asyncio.sleep(10)
 
     await safe_edit(status, "⏰ Tiempo de espera agotado. Usa /torrents para revisar el estado.")
+
+
+def _cap_picker_files(files: list[TorrentFile]) -> list[TorrentFile]:
+    return files[:MAX_PICKER_FILES]
+
+
+async def show_select_picker(
+    provider: DebridProvider,
+    message: Message,
+    torrent_id: str,
+    name: str,
+    files: list[TorrentFile],
+):
+    files = _cap_picker_files(files)
+    picker = TorrentPicker(
+        slug=provider.slug,
+        torrent_id=torrent_id,
+        name=name,
+        files=files,
+        mode="select",
+        selected=default_selected(files),
+    )
+    token = remember_picker(picker)
+    await safe_edit(
+        message,
+        picker_text(picker, provider.name),
+        reply_markup=picker_keyboard(token, picker),
+    )
+
+
+async def offer_ready_files(
+    provider: DebridProvider, status: Message, torrent_id: str, info
+):
+    files: list[TorrentFile] = []
+    try:
+        files = list(info.files) if info.files else await provider.torrent_files(torrent_id)
+    except DebridError:
+        files = []
+    if any(item.selected for item in files):
+        files = [item for item in files if item.selected]
+    if any(item.url for item in files):
+        files = [item for item in files if item.url] or files
+    files = _cap_picker_files(files)
+
+    if not files:
+        try:
+            links = await provider.torrent_links(torrent_id)
+        except DebridError as exc:
+            await safe_edit(status, f"❌ {exc}")
+            return
+        if not links:
+            await safe_edit(status, "❌ El torrent no generó ningún enlace.")
+            return
+        if len(links) == 1:
+            token = remember(links[0], provider)
+            await safe_edit(
+                status,
+                describe(links[0], provider.name),
+                reply_markup=action_keyboard(token),
+            )
+            return
+        files = [
+            TorrentFile(id=str(i), name=link.filename, size=link.size, url=link.url)
+            for i, link in enumerate(links)
+        ]
+        picker = TorrentPicker(
+            slug=provider.slug,
+            torrent_id=torrent_id,
+            name=info.name,
+            files=_cap_picker_files(files),
+            mode="ready",
+        )
+        picker.links = {item.id: link for item, link in zip(picker.files, links)}
+        token = remember_picker(picker)
+        await safe_edit(
+            status,
+            picker_text(picker, provider.name),
+            reply_markup=picker_keyboard(token, picker),
+        )
+        return
+
+    if len(files) == 1:
+        await safe_edit(status, f"✅ **{info.name}**\nCompletado, generando enlace...")
+        try:
+            link = await provider.torrent_file_link(torrent_id, files[0])
+        except DebridError as exc:
+            await safe_edit(status, f"❌ {exc}")
+            return
+        except Exception:
+            log.exception("Error generando enlace de torrent %s", torrent_id)
+            await safe_edit(status, "❌ No pude generar el enlace del archivo.")
+            return
+        token = remember(link, provider)
+        await safe_edit(
+            status, describe(link, provider.name), reply_markup=action_keyboard(token)
+        )
+        return
+
+    picker = TorrentPicker(
+        slug=provider.slug,
+        torrent_id=torrent_id,
+        name=info.name,
+        files=files,
+        mode="ready",
+    )
+    token = remember_picker(picker)
+    await safe_edit(
+        status,
+        picker_text(picker, provider.name),
+        reply_markup=picker_keyboard(token, picker),
+    )
+
+
+async def present_torrent_picker(
+    provider: DebridProvider, message: Message, torrent_id: str
+):
+    info = await provider.torrent_info(torrent_id)
+    if info.needs_file_selection or info.status == "select":
+        files = list(info.files or [])
+        if not files:
+            files = await provider.torrent_files(torrent_id)
+        if not files:
+            await safe_edit(
+                message,
+                f"⏳ **{info.name}**\nAún no hay lista de archivos. Pulsa actualizar.",
+            )
+            return
+        if len(files) == 1:
+            await safe_edit(
+                message,
+                f"🧲 **{info.name}**\n1 archivo, empezando descarga en {provider.name}...",
+            )
+            await provider.select_torrent_files(torrent_id, [files[0].id])
+            spawn(monitor_torrent(provider, message, torrent_id, skip_select=True))
+            return
+        await show_select_picker(provider, message, torrent_id, info.name, files)
+        return
+    if info.status == "ready":
+        await offer_ready_files(provider, message, torrent_id, info)
+        return
+    await safe_edit(
+        message,
+        f"🧲 **{info.name}** aún no está listo "
+        f"({info.detail or info.status}, {info.progress:.0f}%).",
+    )
+
+
+async def send_link_cards(
+    message: Message, provider: DebridProvider, links: list[UnrestrictedLink]
+):
+    for link in links[:MAX_TORRENT_FILES]:
+        token = remember(link, provider)
+        await message.reply_text(
+            describe(link, provider.name), reply_markup=action_keyboard(token)
+        )
+    if len(links) > MAX_TORRENT_FILES:
+        await message.reply_text(
+            f"… y {len(links) - MAX_TORRENT_FILES} archivo(s) más en la web de {provider.name}."
+        )
+
+
+async def send_torrent_file_card(
+    message: Message,
+    provider: DebridProvider,
+    picker: TorrentPicker,
+    torrent_file: TorrentFile,
+):
+    wait = await message.reply_text(f"⏳ Preparando **{torrent_file.name}**...")
+    try:
+        if torrent_file.id in picker.links:
+            link = picker.links[torrent_file.id]
+        else:
+            link = await provider.torrent_file_link(picker.torrent_id, torrent_file)
+            picker.links[torrent_file.id] = link
+    except DebridError as exc:
+        await safe_edit(wait, f"❌ **{torrent_file.name}**\n{exc}")
+        return
+    except Exception:
+        log.exception("Error generando enlace de %s", torrent_file.name)
+        await safe_edit(wait, f"❌ No pude generar el enlace de **{torrent_file.name}**.")
+        return
+    token = remember(link, provider)
+    await safe_edit(
+        wait, describe(link, provider.name), reply_markup=action_keyboard(token)
+    )
 
 
 # ---------------------------------------------------------------- callbacks
@@ -1312,7 +1708,11 @@ async def on_callback(client: Client, query: CallbackQuery):
         await query.answer()
         return
 
-    if action in ("tor", "torlist", "torlinks", "torre", "tordel", "tordelok"):
+    if action == "tf":
+        await handle_torrent_picker(query, value)
+        return
+
+    if action in ("tor", "torlist", "torlinks", "torre", "tordel", "tordelok", "torfiles"):
         await handle_torrent_callback(query, action, value)
         return
 
@@ -1534,24 +1934,14 @@ async def handle_torrent_callback(query: CallbackQuery, action: str, value: str)
             text, keyboard = await torrent_detail_view(provider, torrent_id)
             await safe_edit(query.message, text, reply_markup=keyboard)
 
+        elif action == "torfiles":
+            await query.answer()
+            await present_torrent_picker(provider, query.message, torrent_id)
+
         elif action == "torlinks":
-            await query.answer("Generando enlaces...")
-            await safe_edit(query.message, "📂 Generando enlaces...")
-            links = await provider.torrent_links(torrent_id)
-            if not links:
-                await safe_edit(query.message, "❌ El torrent no generó ningún enlace.")
-                return
-            for link in links[:MAX_TORRENT_FILES]:
-                token = remember(link, provider)
-                await query.message.reply_text(
-                    describe(link, provider.name), reply_markup=action_keyboard(token)
-                )
-            extra = (
-                f" (+{len(links) - MAX_TORRENT_FILES} más en la web)"
-                if len(links) > MAX_TORRENT_FILES
-                else ""
-            )
-            await safe_edit(query.message, f"📂 {len(links)} archivo(s){extra} ⬇️")
+            # botones viejos: mismo flujo que el picker listo
+            await query.answer()
+            await present_torrent_picker(provider, query.message, torrent_id)
 
         elif action == "torre":
             await provider.restart_torrent(torrent_id)
@@ -1589,6 +1979,152 @@ async def handle_torrent_callback(query: CallbackQuery, action: str, value: str)
         await query.answer(str(exc)[:190], show_alert=True)
     except Exception:
         log.exception("Error en callback de torrent %s", query.data)
+        await query.answer("❌ Error inesperado.", show_alert=True)
+
+
+async def handle_torrent_picker(query: CallbackQuery, value: str):
+    token, _, rest = value.partition(":")
+    picker = pending_pickers.get(token)
+    if not picker:
+        await query.answer(
+            "Este menú ha caducado. Usa /torrents o vuelve a mandar el torrent.",
+            show_alert=True,
+        )
+        return
+    provider = providers.get(picker.slug)
+    if not provider:
+        await query.answer("Ese servicio ya no está configurado.", show_alert=True)
+        return
+
+    cmd, _, arg = rest.partition(":")
+
+    async def refresh():
+        await safe_edit(
+            query.message,
+            picker_text(picker, provider.name),
+            reply_markup=picker_keyboard(token, picker),
+        )
+
+    try:
+        if cmd == "t":
+            idx = int(arg)
+            if not 0 <= idx < len(picker.files):
+                await query.answer()
+                return
+            if idx in picker.selected:
+                picker.selected.discard(idx)
+            else:
+                picker.selected.add(idx)
+            await query.answer()
+            await refresh()
+            return
+
+        if cmd == "p":
+            picker.page = int(arg)
+            await query.answer()
+            await refresh()
+            return
+
+        if cmd == "all":
+            picker.selected = set(range(len(picker.files)))
+            await query.answer("Todos")
+            await refresh()
+            return
+
+        if cmd == "vid":
+            videos = {i for i, f in enumerate(picker.files) if _is_main_video(f)}
+            if not videos:
+                await query.answer("No hay vídeos en este torrent.", show_alert=True)
+                return
+            picker.selected = videos
+            await query.answer("Vídeos")
+            await refresh()
+            return
+
+        if cmd == "none":
+            picker.selected.clear()
+            await query.answer("Ninguno")
+            await refresh()
+            return
+
+        if cmd == "go":
+            if picker.mode != "select":
+                await query.answer()
+                return
+            if not picker.selected:
+                await query.answer("Elige al menos un archivo.", show_alert=True)
+                return
+            ids = [picker.files[i].id for i in sorted(picker.selected)]
+            n = len(ids)
+            size = sum((picker.files[i].size or 0) for i in picker.selected)
+            size_s = f" · {human_size(size)}" if size else ""
+            await query.answer("Descargando...")
+            await safe_edit(
+                query.message,
+                f"🧲 **{picker.name}**\n"
+                f"⬇️ {n} archivo(s) seleccionados{size_s}\n"
+                f"Empezando descarga en {provider.name}...",
+            )
+            try:
+                await provider.select_torrent_files(picker.torrent_id, ids)
+            except DebridError as exc:
+                await safe_edit(query.message, f"❌ {exc}")
+                return
+            spawn(monitor_torrent(provider, query.message, picker.torrent_id, skip_select=True))
+            return
+
+        if cmd == "f":
+            if picker.mode != "ready":
+                await query.answer()
+                return
+            idx = int(arg)
+            if not 0 <= idx < len(picker.files):
+                await query.answer("Archivo no válido.", show_alert=True)
+                return
+            torrent_file = picker.files[idx]
+            await query.answer(torrent_file.name[:180])
+            await send_torrent_file_card(query.message, provider, picker, torrent_file)
+            return
+
+        if cmd == "dump":
+            await query.answer("Generando enlaces...")
+            await safe_edit(query.message, f"📂 Generando enlaces de **{picker.name}**...")
+            try:
+                links = await provider.torrent_links(picker.torrent_id)
+            except DebridError as exc:
+                await safe_edit(
+                    query.message,
+                    picker_text(picker, provider.name) + f"\n\n❌ {exc}",
+                    reply_markup=picker_keyboard(token, picker),
+                )
+                return
+            if not links:
+                await safe_edit(
+                    query.message,
+                    picker_text(picker, provider.name)
+                    + "\n\n❌ El torrent no generó ningún enlace.",
+                    reply_markup=picker_keyboard(token, picker),
+                )
+                return
+            await send_link_cards(query.message, provider, links)
+            extra = (
+                f" (primeros {MAX_TORRENT_FILES})"
+                if len(links) > MAX_TORRENT_FILES
+                else ""
+            )
+            await safe_edit(
+                query.message,
+                picker_text(picker, provider.name)
+                + f"\n\n📦 {len(links)} archivo(s){extra} enviados abajo.",
+                reply_markup=picker_keyboard(token, picker),
+            )
+            return
+
+        await query.answer()
+    except ValueError:
+        await query.answer()
+    except Exception:
+        log.exception("Error en picker de torrent %s", query.data)
         await query.answer("❌ Error inesperado.", show_alert=True)
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiohttp
 
-from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
+from .base import DebridError, DebridProvider, TorrentFile, TorrentInfo, UnrestrictedLink
 
 BASE = "https://www.premiumize.me/api"
 
@@ -80,45 +80,57 @@ class Premiumize(DebridProvider):
     async def torrent_info(self, torrent_id: str) -> TorrentInfo:
         return self._to_info(await self._find_transfer(torrent_id))
 
-    async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
+    async def torrent_files(self, torrent_id: str) -> list[TorrentFile]:
         transfer = await self._find_transfer(torrent_id)
-
         if transfer.get("file_id"):
             data = await self._request(
                 "GET", "/item/details", params={"id": str(transfer["file_id"])}
             )
-            if data.get("link"):
-                return [
-                    UnrestrictedLink(
-                        url=data["link"],
-                        filename=data.get("name") or "archivo",
-                        host=self.slug,
-                        size=data.get("size") or None,
-                    )
-                ]
-            return []
-
+            if not data.get("link") and not data.get("name"):
+                return []
+            return [
+                TorrentFile(
+                    id=str(transfer["file_id"]),
+                    name=data.get("name") or "archivo",
+                    size=data.get("size") or None,
+                    url=data.get("link"),
+                    selected=True,
+                )
+            ]
         if transfer.get("folder_id"):
-            return await self._folder_links(str(transfer["folder_id"]))
-
+            return await self._folder_files(str(transfer["folder_id"]))
         return []
 
-    async def _folder_links(self, folder_id: str) -> list[UnrestrictedLink]:
+    async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
+        return [
+            UnrestrictedLink(
+                url=file.url,
+                filename=file.name,
+                host=self.slug,
+                size=file.size,
+            )
+            for file in await self.torrent_files(torrent_id)
+            if file.url
+        ]
+
+    async def _folder_files(self, folder_id: str) -> list[TorrentFile]:
         data = await self._request("GET", "/folder/list", params={"id": folder_id})
-        links: list[UnrestrictedLink] = []
+        files: list[TorrentFile] = []
         for item in data.get("content") or []:
             if item.get("type") == "folder":
-                links.extend(await self._folder_links(str(item["id"])))
-            elif item.get("link"):
-                links.append(
-                    UnrestrictedLink(
-                        url=item["link"],
-                        filename=item.get("name") or "archivo",
-                        host=self.slug,
+                files.extend(await self._folder_files(str(item["id"])))
+            elif item.get("link") or item.get("type") == "file":
+                name = item.get("name") or "archivo"
+                files.append(
+                    TorrentFile(
+                        id=str(item.get("id") or name),
+                        name=name,
                         size=item.get("size") or None,
+                        url=item.get("link"),
+                        selected=True,
                     )
                 )
-        return links
+        return files
 
     async def list_torrents(self) -> list[TorrentInfo]:
         data = await self._request("GET", "/transfer/list")

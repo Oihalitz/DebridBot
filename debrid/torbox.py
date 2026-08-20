@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from .base import DebridError, DebridProvider, TorrentInfo, UnrestrictedLink
+from .base import DebridError, DebridProvider, TorrentFile, TorrentInfo, UnrestrictedLink
 
 BASE = "https://api.torbox.app/v1/api"
 
@@ -96,28 +96,32 @@ class TorBox(DebridProvider):
     async def torrent_info(self, torrent_id: str) -> TorrentInfo:
         return self._to_info(await self._get_torrent(torrent_id))
 
+    async def torrent_files(self, torrent_id: str) -> list[TorrentFile]:
+        return _files_from_torbox(await self._get_torrent(torrent_id))
+
     async def torrent_links(self, torrent_id: str) -> list[UnrestrictedLink]:
-        item = await self._get_torrent(torrent_id)
+        files = await self.torrent_files(torrent_id)
         links = []
-        for file in item.get("files") or []:
-            url = await self._request(
-                "GET",
-                "/torrents/requestdl",
-                params={
-                    "token": self.api_key,
-                    "torrent_id": str(torrent_id),
-                    "file_id": str(file["id"]),
-                },
-            )
-            links.append(
-                UnrestrictedLink(
-                    url=url,
-                    filename=file.get("short_name") or file.get("name") or "archivo",
-                    host="torbox",
-                    size=file.get("size") or None,
-                )
-            )
+        for file in files:
+            links.append(await self.torrent_file_link(torrent_id, file))
         return links
+
+    async def torrent_file_link(self, torrent_id: str, file: TorrentFile) -> UnrestrictedLink:
+        url = await self._request(
+            "GET",
+            "/torrents/requestdl",
+            params={
+                "token": self.api_key,
+                "torrent_id": str(torrent_id),
+                "file_id": str(file.id),
+            },
+        )
+        return UnrestrictedLink(
+            url=url,
+            filename=file.name,
+            host="torbox",
+            size=file.size,
+        )
 
     async def list_torrents(self) -> list[TorrentInfo]:
         data = await self._request("GET", "/torrents/mylist", params={"bypass_cache": "true"})
@@ -147,4 +151,21 @@ class TorBox(DebridProvider):
             status=status,
             progress=float(item.get("progress") or 0) * 100,
             detail=state,
+            files=_files_from_torbox(item),
         )
+
+
+def _files_from_torbox(item: dict) -> list[TorrentFile]:
+    files: list[TorrentFile] = []
+    for entry in item.get("files") or []:
+        path = entry.get("name") or entry.get("short_name") or "archivo"
+        files.append(
+            TorrentFile(
+                id=str(entry.get("id") or path),
+                name=entry.get("short_name") or path.rsplit("/", 1)[-1],
+                path=path,
+                size=entry.get("size") or None,
+                selected=True,
+            )
+        )
+    return files
