@@ -489,14 +489,14 @@ async def probe_raw_file(session: aiohttp.ClientSession, url: str) -> Unrestrict
 
 
 def prefers_ytdlp_first(url: str) -> bool:
-    """Instagram y similares: yt-dlp antes que debrid (si YTDLP=true)."""
+    """Sitios multimedia reconocidos: yt-dlp antes que debrid."""
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
     if not host:
         return False
     for suffix in _YTDLP_FIRST_HOST_SUFFIXES:
         if host == suffix or host.endswith("." + suffix):
             return True
-    return False
+    return ytdlp_mod.supports_url(url)
 
 
 async def resolve_link(
@@ -508,8 +508,9 @@ async def resolve_link(
 ) -> tuple[UnrestrictedLink, str]:
     """Orden por defecto: debrid → archivo directo → yt-dlp.
 
-    En Instagram (y hosts de `_YTDLP_FIRST_HOST_SUFFIXES`), si YTDLP=true y
-    allow_ytdlp, yt-dlp va **antes** del debrid.
+    En sitios reconocidos por un extractor específico de yt-dlp, si
+    YTDLP=true y allow_ytdlp, yt-dlp va **antes** del debrid. El extractor
+    genérico queda como fallback para no retrasar los hosters.
 
     En mensajes sueltos se usa allow_ytdlp=False y luego el menú de calidades.
     En lotes (paste/filecrypt) se deja allow_ytdlp=True con la calidad por defecto.
@@ -538,7 +539,7 @@ async def resolve_link(
             )
         return links[0], DRIPFILES_PROVIDER
 
-    # Instagram etc.: yt-dlp primero
+    # YouTube, Vimeo, Instagram, etc.: yt-dlp primero
     if allow_ytdlp and cfg.ytdlp and prefers_ytdlp_first(url):
         try:
             link = await ytdlp_mod.extract(url, cfg.ytdlp_format)
@@ -1233,7 +1234,7 @@ async def handle_text(_, message: Message):
     url = normalize_mirrors(text)
     status: Message | None = None
 
-    # Instagram y similares: menú yt-dlp primero (si está habilitado)
+    # Sitios multimedia reconocidos: menú yt-dlp primero (si está habilitado)
     if cfg.ytdlp and prefers_ytdlp_first(url):
         status = await message.reply_text("🎬 Buscando calidades con yt-dlp...")
         try:
@@ -1267,7 +1268,7 @@ async def handle_text(_, message: Message):
 
     try:
         # sin yt-dlp automático aquí: si falla debrid/directo, menú de calidades
-        # (excepto Instagram, ya intentado arriba)
+        # (excepto los sitios reconocidos, ya intentados arriba)
         link, provider_name = await resolve_link(
             message.from_user.id, url, allow_ytdlp=False, auto_pick_stream=False
         )

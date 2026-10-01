@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -80,6 +81,30 @@ def available() -> bool:
         return True
     except ImportError:
         return False
+
+
+@lru_cache(maxsize=512)
+def supports_url(url: str) -> bool:
+    """True si un extractor específico de yt-dlp reconoce la URL.
+
+    Se excluye el extractor genérico porque acepta prácticamente cualquier
+    página y haría que yt-dlp se ejecutase antes que debrid para los hosters.
+    """
+    try:
+        from yt_dlp.extractor import gen_extractor_classes
+    except ImportError:
+        return False
+
+    for extractor in gen_extractor_classes():
+        if extractor.IE_NAME == "generic":
+            continue
+        try:
+            if extractor.suitable(url):
+                return True
+        except Exception:
+            # Un extractor defectuoso no debe impedir probar los demás.
+            continue
+    return False
 
 
 def ffmpeg_available() -> bool:
