@@ -66,6 +66,14 @@ class MediaProbe:
     options: list[QualityOption] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class StreamTarget:
+    """Origen temporal que el relay puede solicitar con sus cabeceras."""
+
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
 def available() -> bool:
     try:
         import yt_dlp  # noqa: F401
@@ -398,7 +406,20 @@ def _extract_sync(url: str, format_selector: str) -> dict:
     return _pick_info(info)
 
 
-def _stream_url_sync(url: str, format_selector: str) -> str:
+def _stream_target(info: dict, url: str, fallback: dict | None = None) -> StreamTarget:
+    raw_headers = {}
+    if fallback:
+        raw_headers.update(fallback.get("http_headers") or {})
+    raw_headers.update(info.get("http_headers") or {})
+    headers = {
+        str(key): str(value)
+        for key, value in raw_headers.items()
+        if value is not None
+    }
+    return StreamTarget(url=str(url), headers=headers)
+
+
+def _stream_target_sync(url: str, format_selector: str) -> StreamTarget:
     """Mejor URL directa de un solo archivo (progresivo); si no hay, la del formato principal."""
     import yt_dlp
 
@@ -408,7 +429,7 @@ def _stream_url_sync(url: str, format_selector: str) -> str:
         direct = info.get("url")
         # requested_formats = fusión de varios streams → no hay URL única útil
         if direct and not info.get("requested_formats"):
-            return direct
+            return _stream_target(info, direct)
     except YtDlpError:
         pass
 
@@ -428,14 +449,14 @@ def _stream_url_sync(url: str, format_selector: str) -> str:
 
     direct = info.get("url")
     if direct and not info.get("requested_formats"):
-        return direct
+        return _stream_target(info, direct)
     for fmt in reversed(info.get("formats") or []):
         candidate = fmt.get("url")
         if candidate and _vcodec_ok(fmt):
-            return candidate
+            return _stream_target(fmt, candidate, info)
     for fmt in reversed(info.get("formats") or []):
         if fmt.get("url"):
-            return fmt["url"]
+            return _stream_target(fmt, fmt["url"], info)
     raise YtDlpError(
         "No hay una URL directa usable (stream segmentado). Usa la opción 📤 Archivo."
     )
@@ -743,7 +764,15 @@ def describe_media(media: MediaProbe) -> str:
 
 
 async def stream_url(url: str, format_selector: str = "bv*+ba/b") -> str:
-    return await asyncio.to_thread(_stream_url_sync, url, format_selector)
+    """Compatibilidad: devuelve solo la URL temporal, sin sus cabeceras."""
+    return (await stream_target(url, format_selector)).url
+
+
+async def stream_target(
+    url: str, format_selector: str = "bv*+ba/b"
+) -> StreamTarget:
+    """Resuelve una URL temporal y las cabeceras que exige su CDN."""
+    return await asyncio.to_thread(_stream_target_sync, url, format_selector)
 
 
 async def download(

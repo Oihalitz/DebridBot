@@ -31,7 +31,7 @@ from debrid import (
     UnrestrictedLink,
     build_providers,
 )
-from linkproxy import LinkProxy, detect_public_ip
+from linkproxy import LinkProxy, RelayTarget, detect_public_ip
 from filecrypt import (
     CaptchaRequired,
     FilecryptError,
@@ -625,6 +625,22 @@ def public_url(link: UnrestrictedLink) -> str:
     # con LINK_PROXY el usuario recibe una URL del bot, no la del debrid,
     # para que el debrid solo vea descargas desde la IP del servidor
     if link_proxy:
+        if link.via == "ytdlp":
+
+            async def resolve_ytdlp_target() -> RelayTarget:
+                target = await ytdlp_mod.stream_target(
+                    link.url, ytdlp_format(link)
+                )
+                return RelayTarget(target.url, target.headers)
+
+            return link_proxy.register(
+                link,
+                resolver=resolve_ytdlp_target,
+                session=http,
+                # Evita repetir la extracción para HEAD + GET y Range
+                # concurrentes; una reanudación posterior obtiene URL nueva.
+                resolve_ttl=60,
+            )
         return link_proxy.register(link)
     return link.url
 
@@ -1854,6 +1870,15 @@ async def on_callback(client: Client, query: CallbackQuery):
         if action == "link":
             await query.answer()
             if is_ytdlp:
+                if link_proxy:
+                    await safe_edit(
+                        query.message,
+                        describe(link, provider_name)
+                        + f"\n\n🔗 [Descargar]({public_url(link)})\n\n"
+                        "__El relay resuelve la URL temporal al comenzar la descarga. "
+                        "Para HLS/DASH usa 📤 Archivo o 💧 DripFiles.__",
+                    )
+                    return
                 await safe_edit(
                     query.message,
                     describe(link, provider_name) + "\n\n🎬 Obteniendo URL directa...",

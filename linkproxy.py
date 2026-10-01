@@ -13,6 +13,8 @@ import asyncio
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
 import aiohttp
@@ -29,22 +31,77 @@ CHUNK = 256 * 1024
 _PASSTHROUGH = ("Content-Length", "Content-Range", "Accept-Ranges", "Content-Type")
 
 
+@dataclass(frozen=True)
+class RelayTarget:
+    """URL upstream y cabeceras necesarias para descargarla."""
+
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+TargetResolver = Callable[[], Awaitable[RelayTarget]]
+
+
+@dataclass
+class _RelayEntry:
+    link: UnrestrictedLink
+    created_at: float
+    session: aiohttp.ClientSession
+    resolver: TargetResolver | None = None
+    resolve_ttl: float = 0
+    cached_target: RelayTarget | None = None
+    cached_at: float = 0
+    resolve_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def target(self) -> RelayTarget:
+        if self.resolver is None:
+            return RelayTarget(self.link.url)
+
+        now = time.monotonic()
+        if self.cached_target and now - self.cached_at < self.resolve_ttl:
+            return self.cached_target
+
+        # Un navegador suele hacer HEAD seguido de GET y los gestores abren
+        # varios Range a la vez. Una sola extracción sirve a todo ese grupo.
+        async with self.resolve_lock:
+            now = time.monotonic()
+            if self.cached_target and now - self.cached_at < self.resolve_ttl:
+                return self.cached_target
+            target = await self.resolver()
+            self.cached_target = target
+            self.cached_at = time.monotonic()
+            return target
+
+
 class LinkProxy:
     def __init__(self, session: aiohttp.ClientSession, base_url: str):
         self.session = session
         self.base_url = base_url.rstrip("/")
-        self._links: dict[str, tuple[UnrestrictedLink, float]] = {}
+        self._links: dict[str, _RelayEntry] = {}
         self._runner: web.AppRunner | None = None
 
-    def register(self, link: UnrestrictedLink) -> str:
+    def register(
+        self,
+        link: UnrestrictedLink,
+        *,
+        resolver: TargetResolver | None = None,
+        session: aiohttp.ClientSession | None = None,
+        resolve_ttl: float = 0,
+    ) -> str:
         self._purge()
         token = secrets.token_urlsafe(16)
-        self._links[token] = (link, time.time())
+        self._links[token] = _RelayEntry(
+            link=link,
+            created_at=time.time(),
+            session=session or self.session,
+            resolver=resolver,
+            resolve_ttl=resolve_ttl,
+        )
         return f"{self.base_url}/dl/{token}"
 
     def _purge(self) -> None:
         cutoff = time.time() - TOKEN_TTL
-        for token in [t for t, (_, ts) in self._links.items() if ts < cutoff]:
+        for token in [t for t, entry in self._links.items() if entry.created_at < cutoff]:
             del self._links[token]
 
     async def start(self, host: str, port: int) -> None:
@@ -60,19 +117,35 @@ class LinkProxy:
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         entry = self._links.get(request.match_info["token"])
-        if not entry or time.time() - entry[1] > TOKEN_TTL:
+        if not entry or time.time() - entry.created_at > TOKEN_TTL:
             raise web.HTTPNotFound(text="Enlace caducado, pídelo de nuevo al bot.")
-        link = entry[0]
+        link = entry.link
 
-        headers = {}
+        try:
+            target = await entry.target()
+        except Exception:
+            log.exception("No se pudo resolver el origen temporal para %s", link.filename)
+            raise web.HTTPBadGateway(
+                text="No se pudo preparar el enlace temporal. Pídelo de nuevo al bot."
+            )
+
+        # yt-dlp puede necesitar User-Agent, Referer u otras cabeceras del
+        # extractor. Host/Content-Length/Range los controla esta petición.
+        headers = {
+            key: value
+            for key, value in target.headers.items()
+            if key.lower() not in ("host", "content-length", "range")
+        }
         if "Range" in request.headers:  # reanudar / descarga por tramos
             headers["Range"] = request.headers["Range"]
+        if "If-Range" in request.headers:
+            headers["If-Range"] = request.headers["If-Range"]
 
-        async with self.session.get(link.url, headers=headers) as upstream:
+        async with entry.session.get(target.url, headers=headers) as upstream:
             if upstream.status >= 400:
-                log.warning("El debrid respondió %s para %s", upstream.status, link.filename)
+                log.warning("El origen respondió %s para %s", upstream.status, link.filename)
                 return web.Response(
-                    status=upstream.status, text=f"El servicio debrid respondió {upstream.status}"
+                    status=upstream.status, text=f"El servidor de origen respondió {upstream.status}"
                 )
             resp = web.StreamResponse(status=upstream.status)
             for header in _PASSTHROUGH:
@@ -84,6 +157,9 @@ class LinkProxy:
                 f"filename*=UTF-8''{quote(link.filename)}"
             )
             await resp.prepare(request)
+            if request.method == "HEAD":
+                await resp.write_eof()
+                return resp
             try:
                 async for chunk in upstream.content.iter_chunked(CHUNK):
                     await resp.write(chunk)
